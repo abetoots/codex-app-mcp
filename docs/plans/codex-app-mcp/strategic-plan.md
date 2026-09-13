@@ -1,6 +1,6 @@
 # codex-app-mcp Strategic Plan
 
-**Date:** 2026-09-14 · **Status:** GO-A conditional (panel sign-off recorded in `~/.claude/docs/decisions/2026-09-14-codex-leg-transport.md`; amendments in `phase-1-mvp-server.md`) · **Research:** `docs/research/2026-09-14-codex-mcp-replacement.md`
+**Date:** 2026-09-14 · **Status:** Implemented (8 tasks, TDD, committed `2a0b78a`..`3f16c2a`; live-verified against codex-cli 0.154.0; wired into `~/.claude.json` and `~/ai-cli-sync/mcp-servers.yaml`) · **Research:** `docs/research/2026-09-14-codex-mcp-replacement.md`
 
 ## Problem Statement
 

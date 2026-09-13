@@ -1,5 +1,7 @@
 # Phase 1: codex-app-mcp MVP Implementation Plan
 
+
+**Status:** Implemented. All 8 tasks landed (see repo git log); amendments below are load-bearing and reflected in `src/`.
 > **For Claude:** Use executing-plans or subagent-driven-development to implement this plan task-by-task, after Phase 0 sign-off.
 
 **Goal:** A stdio MCP server that exposes `codex` and `codex-reply` (old names, old schema) by driving one long-lived `codex app-server --stdio` child.
