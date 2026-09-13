@@ -108,17 +108,26 @@ describe("approval/permission/user-input/elicitation table", () => {
 
   for (const [method] of cases) {
     it(`declines ${method} with the exact fixture response and records it`, async () => {
-      const runner = await makeRunner("approval-request", { FAKE_APPROVAL_METHOD: method });
+      const client = tracked("approval-request", { FAKE_APPROVAL_METHOD: method });
+      await client.initialize();
+      const runner = new TurnRunner(client);
       const { threadId } = await runner.startThread(readOnlySettings);
 
+      // the fake server echoes back whatever TurnRunner actually sent as the response to its
+      // server-initiated request, so this proves (at runtime, not by static import) that
+      // TurnRunner sent exactly the schema-shaped decline tests/protocol.test.ts validates
+      const echo = waitForNotification(client, "test/echo") as Promise<{
+        receivedResult: unknown;
+        receivedError: unknown;
+      }>;
       const result = await runner.runTurn(threadId, "hi");
+      const echoed = await echo;
 
       const fixture = serverRequestResponses[method as keyof typeof serverRequestResponses];
       expect(result.status).toBe("completed");
       expect(result.declinedRequests).toEqual([method]);
-      // the fixture is exactly what tests/protocol.test.ts validates against the schema for
-      // this method's response, so this proves TurnRunner sent the schema-shaped decline
-      expect(fixture.response).toBeDefined();
+      expect(echoed.receivedError).toBeNull();
+      expect(echoed.receivedResult).toEqual(fixture.response);
     });
   }
 
@@ -134,19 +143,6 @@ describe("approval/permission/user-input/elicitation table", () => {
 
     expect(echoed.receivedError).toMatchObject({ code: -32601 });
     expect(result.declinedRequests).toEqual([]);
-  });
-
-  it("the response TurnRunner sends matches the exact fixture literal (echoed back)", async () => {
-    const client = tracked("approval-request", { FAKE_APPROVAL_METHOD: SERVER_REQUESTS.commandExecutionApproval });
-    await client.initialize();
-    const runner = new TurnRunner(client);
-    const { threadId } = await runner.startThread(readOnlySettings);
-
-    const echo = waitForNotification(client, "test/echo");
-    await runner.runTurn(threadId, "hi");
-    const echoed = (await echo) as { receivedResult: unknown };
-
-    expect(echoed.receivedResult).toEqual(serverRequestResponses[SERVER_REQUESTS.commandExecutionApproval].response);
   });
 });
 
