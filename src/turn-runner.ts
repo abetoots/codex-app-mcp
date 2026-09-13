@@ -87,6 +87,9 @@ export class TurnRunner {
   // one queued promise per threadId, so a second runTurn() on the same thread waits for the
   // first to settle; different threads get independent queues and run concurrently.
   private readonly threadLocks = new Map<string, Promise<unknown>>();
+  // one in-flight thread/resume promise per threadId, so two concurrent ensureThread() calls
+  // for the same never-before-seen id share a single thread/resume instead of both firing one.
+  private readonly ensureThreadLocks = new Map<string, Promise<void>>();
   // declinedRequests list for whichever turn is currently active on a given threadId, so the
   // single onServerRequest dispatcher below knows where to record a decline.
   private readonly activeDeclines = new Map<string, string[]>();
@@ -114,13 +117,28 @@ export class TurnRunner {
   // otherwise calls thread/resume so a thread from a previous process can be continued.
   async ensureThread(threadId: string, fallback: ThreadSettings): Promise<void> {
     if (this.knownThreadIds.has(threadId)) return;
-    await this.client.request(CLIENT_REQUESTS.threadResume, {
-      threadId,
-      cwd: fallback.cwd,
-      approvalPolicy: fallback.approvalPolicy,
-      sandbox: fallback.sandbox,
-    });
-    this.knownThreadIds.add(threadId);
+
+    // a second concurrent call for the same id joins the first's in-flight thread/resume
+    // instead of sending its own -- mirrors threadLocks' per-thread serialization above.
+    const pending = this.ensureThreadLocks.get(threadId);
+    if (pending) return pending;
+
+    const promise = (async (): Promise<void> => {
+      await this.client.request(CLIENT_REQUESTS.threadResume, {
+        threadId,
+        cwd: fallback.cwd,
+        approvalPolicy: fallback.approvalPolicy,
+        sandbox: fallback.sandbox,
+      });
+      this.knownThreadIds.add(threadId);
+    })();
+
+    this.ensureThreadLocks.set(threadId, promise);
+    try {
+      await promise;
+    } finally {
+      this.ensureThreadLocks.delete(threadId);
+    }
   }
 
   // runs one turn on threadId. concurrent calls for the SAME threadId are serialized: the next

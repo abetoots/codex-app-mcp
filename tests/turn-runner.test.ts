@@ -302,4 +302,21 @@ describe("ensureThread", () => {
 
     expect(elapsed).toBeLessThan(50);
   });
+
+  it("does not send a second thread/resume for two concurrent calls on the same never-before-seen id", async () => {
+    const runner = await makeRunner("resume");
+
+    // the "resume" fake-server scenario replies immediately to the first thread/resume it sees,
+    // but delays 300ms before replying to a second one -- a well-behaved ensureThread must never
+    // send that second request, so both calls here should settle well within that delay
+    const start = Date.now();
+    await withTimeout(
+      Promise.all([runner.ensureThread("old-thread", readOnlySettings), runner.ensureThread("old-thread", readOnlySettings)]),
+      250,
+      "concurrent ensureThread",
+    );
+    const elapsed = Date.now() - start;
+
+    expect(elapsed).toBeLessThan(250);
+  });
 });
