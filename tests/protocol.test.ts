@@ -92,6 +92,19 @@ describe("protocol method names exist in the generated app-server schema", () =>
   }
 });
 
+describe("protocol.ts declares every ServerRequest variant the schema knows about", () => {
+  it("SERVER_REQUESTS is not missing a method the schema declares", () => {
+    // the reverse of the check above: a new schema-declared ServerRequest variant that
+    // protocol.ts hasn't picked up wouldn't fail the drift alarm without this direction too
+    const known = methodNames(loadSchema("ServerRequest.json"));
+    const declared = new Set(Object.values(SERVER_REQUESTS));
+    expect(known.size).toBeGreaterThan(0);
+    for (const name of known) {
+      expect(declared, `${name} is declared in ServerRequest.json but missing from SERVER_REQUESTS`).toContain(name);
+    }
+  });
+});
+
 describe("client request fixtures validate against ClientRequest.json", () => {
   for (const [key, request] of Object.entries(clientRequests)) {
     it(`${key} (${request.method})`, () => {
