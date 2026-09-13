@@ -275,6 +275,17 @@ describe("codex-reply tool", () => {
     expect(result.structuredContent).toMatchObject({ threadId: "never-seen-before" });
   });
 
+  it("ensureThread rejecting (thread/resume itself returns a JSON-RPC error) -> isError:true with a sensible message", async () => {
+    const runner = await makeRunner("resume-error");
+    const tool = createCodexReplyTool(runner);
+
+    const result = await tool.handler({ ...defaultReplyInput, threadId: "old-thread" }, asExtra(fakeExtra()));
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toEqual({ threadId: "old-thread", errorText: "thread resume failed" });
+    expect((result.content[0] as { text: string }).text).toMatch(/thread resume failed/);
+  });
+
   it("runTurn rejecting (turn/start errors after a successful resume) still reports structuredContent.threadId", async () => {
     const runner = await makeRunner("resume-then-turn-start-error");
     const tool = createCodexReplyTool(runner);

@@ -458,6 +458,18 @@ const scenarios = {
     await finishTurn(threadId, turnIdB, [{ phase: "final_answer", text: "real-B" }]);
   },
 
+  // thread/resume itself returns a JSON-RPC error -- covers codex-reply's ensureThread failing
+  // before any turn/start is ever attempted, unlike "resume-then-turn-start-error" which fails
+  // later, after a successful resume.
+  async "resume-error"() {
+    const init = await expect("initialize");
+    replyResult(init, initializeResult);
+    await expect("initialized");
+
+    const resume = await expect("thread/resume");
+    replyError(resume, { code: -32000, message: "thread resume failed" });
+  },
+
   async resume() {
     const init = await expect("initialize");
     replyResult(init, initializeResult);
