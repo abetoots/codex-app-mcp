@@ -1,6 +1,7 @@
 // the exact json-rpc payloads codex-app-mcp exchanges with the app-server.
 // tests/protocol.test.ts validates each one against the regenerated schema in ./schema.
 import { CLIENT_NOTIFICATIONS, CLIENT_REQUESTS, SERVER_REQUESTS } from "../../src/protocol.js";
+import { DECLINE_RESPONSES } from "../../src/responses.js";
 
 // requests we send (id is added by the transport)
 export const clientRequests = {
@@ -34,41 +35,36 @@ export const clientNotifications = {
   initialized: { method: CLIENT_NOTIFICATIONS.initialized },
 } as const;
 
-// legacy (v1) approvals use ReviewDecision, whose "denied" variant is an object carrying a reason;
-// the plain string form was removed upstream, so the drift test would catch `{decision:"denied"}`
-const legacyDenied = {
-  decision: { denied: { rejection: "codex-app-mcp runs headless and cannot approve requests" } },
-} as const;
-
-// responses we send to server->client requests, keyed by method, with the schema file each must satisfy.
-// this server runs headless, so every approval is declined and every prompt gets an empty answer.
+// responses we send to server->client requests, keyed by method, with the schema file each must
+// satisfy. the response literals live in src/responses.ts (also used by src/turn-runner.ts) so
+// there is exactly one copy of each payload; this fixture only adds the schema filename pairing.
 export const serverRequestResponses = {
   [SERVER_REQUESTS.commandExecutionApproval]: {
     schema: "CommandExecutionRequestApprovalResponse.json",
-    response: { decision: "decline" },
+    response: DECLINE_RESPONSES[SERVER_REQUESTS.commandExecutionApproval],
   },
   [SERVER_REQUESTS.fileChangeApproval]: {
     schema: "FileChangeRequestApprovalResponse.json",
-    response: { decision: "decline" },
+    response: DECLINE_RESPONSES[SERVER_REQUESTS.fileChangeApproval],
   },
   [SERVER_REQUESTS.permissionsApproval]: {
     schema: "PermissionsRequestApprovalResponse.json",
-    response: { permissions: {} },
+    response: DECLINE_RESPONSES[SERVER_REQUESTS.permissionsApproval],
   },
   [SERVER_REQUESTS.execCommandApproval]: {
     schema: "ExecCommandApprovalResponse.json",
-    response: legacyDenied,
+    response: DECLINE_RESPONSES[SERVER_REQUESTS.execCommandApproval],
   },
   [SERVER_REQUESTS.applyPatchApproval]: {
     schema: "ApplyPatchApprovalResponse.json",
-    response: legacyDenied,
+    response: DECLINE_RESPONSES[SERVER_REQUESTS.applyPatchApproval],
   },
   [SERVER_REQUESTS.toolRequestUserInput]: {
     schema: "ToolRequestUserInputResponse.json",
-    response: { answers: {} },
+    response: DECLINE_RESPONSES[SERVER_REQUESTS.toolRequestUserInput],
   },
   [SERVER_REQUESTS.mcpServerElicitation]: {
     schema: "McpServerElicitationRequestResponse.json",
-    response: { action: "decline" },
+    response: DECLINE_RESPONSES[SERVER_REQUESTS.mcpServerElicitation],
   },
 } as const;
