@@ -258,6 +258,22 @@ describe("per-thread serialization", () => {
   });
 });
 
+describe("turnId correlation across a timed-out turn and its successor", () => {
+  it("ignores a stale item/completed and turn/completed from a timed-out prior turn on the same thread", async () => {
+    const runner = await makeRunner("stale-turn-after-timeout");
+    const { threadId } = await runner.startThread(readOnlySettings);
+
+    const resultA = await withTimeout(runner.runTurn(threadId, "a", { timeoutMs: 50 }), 2000, "runTurn A");
+    expect(resultA.status).toBe("interrupted");
+    expect(resultA.turnId).toBe("uA");
+
+    const resultB = await withTimeout(runner.runTurn(threadId, "b"), 2000, "runTurn B");
+    expect(resultB.status).toBe("completed");
+    expect(resultB.turnId).toBe("uB");
+    expect(resultB.text).toBe("real-B");
+  });
+});
+
 describe("ensureThread", () => {
   it("resumes an unknown thread id (fresh process) via thread/resume", async () => {
     const runner = await makeRunner("resume");

@@ -113,11 +113,12 @@ async function runHandshakeAndThreadStart() {
 async function finishTurn(threadId, turnId, items = [{ phase: "final_answer", text: "pong" }]) {
   items.forEach((item, index) => {
     const id = `item-${index + 1}`;
-    send({ method: "item/started", params: { threadId, item: { id, type: "agentMessage" } } });
+    send({ method: "item/started", params: { threadId, turnId, item: { id, type: "agentMessage" } } });
     send({
       method: "item/completed",
       params: {
         threadId,
+        turnId,
         item: { id, type: "agentMessage", phase: item.phase, text: item.text },
       },
     });
@@ -416,6 +417,45 @@ const scenarios = {
 
     const turnStart = await expect("turn/start");
     replyError(turnStart, { code: -32000, message: "turn start failed" });
+  },
+
+  // reproduces the timeout->stale-event race: turn A times out client-side (which fires
+  // turn/interrupt but doesn't wait for the app-server to actually stop the turn), a second
+  // turn B starts on the SAME threadId, and only then does A's late item/completed +
+  // turn/completed arrive on the wire, carrying A's turnId. TurnRunner must correlate by
+  // turnId (not just threadId) so B's listeners ignore A's stale events entirely.
+  async "stale-turn-after-timeout"() {
+    await runHandshakeAndThreadStart();
+
+    const turnStartA = await expect("turn/start");
+    const threadId = turnStartA.params.threadId;
+    const turnIdA = "uA";
+    replyResult(turnStartA, { turn: { id: turnIdA } });
+    send({ method: "turn/started", params: threadStartedItem(threadId, turnIdA) });
+
+    // client times out and interrupts -- reply, but keep A "running" server-side
+    const interrupt = await expect("turn/interrupt");
+    replyResult(interrupt, {});
+
+    // turn B starts on the same threadId once A's synthesized interrupt unblocks the lock
+    const turnStartB = await expect("turn/start");
+    const turnIdB = "uB";
+    replyResult(turnStartB, { turn: { id: turnIdB } });
+    send({ method: "turn/started", params: threadStartedItem(threadId, turnIdB) });
+
+    // A's late events arrive only now, after B's turnId is already known client-side --
+    // these must be ignored, not mistaken for B's own completion
+    send({
+      method: "item/completed",
+      params: {
+        threadId,
+        turnId: turnIdA,
+        item: { id: "stale-item", type: "agentMessage", phase: "final_answer", text: "STALE-A" },
+      },
+    });
+    send({ method: "turn/completed", params: { threadId, turn: { id: turnIdA, status: "completed" } } });
+
+    await finishTurn(threadId, turnIdB, [{ phase: "final_answer", text: "real-B" }]);
   },
 
   async resume() {

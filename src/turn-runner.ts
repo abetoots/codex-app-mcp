@@ -57,17 +57,27 @@ function selectFinalText(messages: AgentMessage[]): string {
   return messages.map((message) => message.text).join("\n\n");
 }
 
-function extractAgentMessage(params: unknown, threadId: string): AgentMessage | undefined {
-  const p = params as { threadId?: string; item?: { type?: string; phase?: string | null; text?: string } };
+// both extractors also reject any event whose turnId doesn't match the turn currently in
+// flight -- see the "stale-turn-after-timeout" fake-server scenario for the race this guards
+// against: a timed-out turn's late item/completed/turn/completed must never be mistaken for
+// its successor's, since the app-server never confirmed the old turn actually stopped.
+function extractAgentMessage(params: unknown, threadId: string, turnId: string | undefined): AgentMessage | undefined {
+  const p = params as {
+    threadId?: string;
+    turnId?: string;
+    item?: { type?: string; phase?: string | null; text?: string };
+  };
   if (p?.threadId !== threadId) return undefined;
+  if (p?.turnId !== turnId) return undefined;
   const item = p.item;
   if (!item || item.type !== "agentMessage" || typeof item.text !== "string") return undefined;
   return { text: item.text, isFinal: item.phase === "final_answer" };
 }
 
-function extractCompletedTurn(params: unknown, threadId: string): CompletedTurn | undefined {
+function extractCompletedTurn(params: unknown, threadId: string, turnId: string | undefined): CompletedTurn | undefined {
   const p = params as { threadId?: string; turn?: CompletedTurn };
   if (p?.threadId !== threadId || !p.turn) return undefined;
+  if (p.turn.id !== turnId) return undefined;
   return p.turn;
 }
 
@@ -168,14 +178,18 @@ export class TurnRunner {
 
       disposers.push(
         this.client.on(SERVER_NOTIFICATIONS.itemCompleted, (params) => {
-          const message = extractAgentMessage(params, threadId);
+          // turnId is read here (not captured at registration time) so this listener tracks
+          // whichever turn is currently expected -- undefined until turn/start's response
+          // resolves, which per the protocol's request/response-then-notification ordering is
+          // always before any genuine notification for this turn can arrive.
+          const message = extractAgentMessage(params, threadId, turnId);
           if (message) messages.push(message);
         }),
       );
 
       disposers.push(
         this.client.on(SERVER_NOTIFICATIONS.turnCompleted, (params) => {
-          const turn = extractCompletedTurn(params, threadId);
+          const turn = extractCompletedTurn(params, threadId, turnId);
           if (!turn) return;
           if (turn.status === "failed") {
             finish({
