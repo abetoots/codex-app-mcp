@@ -1,7 +1,10 @@
-// lighter-touch coverage for src/index.ts: the lazy-spawn/respawn wiring around TurnRunner. a
-// full stdio E2E (spawning `node dist/index.js` and talking MCP over its stdio) is left to Task
-// 7's live smoke test -- this only exercises createLazyTurnRunner directly, which is where all
-// of index.ts's non-trivial logic lives (main() itself is just registerTool + connect wiring).
+// lighter-touch coverage for src/index.ts: the lazy-spawn/respawn wiring around TurnRunner. this
+// only exercises createLazyTurnRunner directly (which is where all of index.ts's non-trivial
+// logic lives -- main() itself is just registerTool + connect wiring), so it never goes through
+// a real MCP transport or the zod default-filling that only happens via McpServer.registerTool.
+// tests/stdio.test.ts covers that: it spawns the actual built entry point and talks MCP over its
+// real stdio transport. Task 7's live.smoke.test.ts does neither -- it calls tools.ts directly
+// against the real `codex app-server`, bypassing the stdio layer just like this file does.
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
