@@ -17,7 +17,7 @@
     "typecheck": "tsc --noEmit",
     "pretest": "node scripts/generate-schema.mjs",
     "test": "vitest run",
-    "smoke": "echo \"see bin/smoke.sh\""
+    "smoke": "bash bin/smoke.sh"
   },
   "license": "MIT",
   "dependencies": {
