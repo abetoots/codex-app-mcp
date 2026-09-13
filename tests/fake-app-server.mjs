@@ -364,6 +364,60 @@ const scenarios = {
     }
   },
 
+  // like runHandshakeAndThreadStart, but echoes thread/start's params via test/echo before
+  // replying -- lets a test assert what codex-app-mcp actually sent (e.g. the mapped
+  // approvalPolicy) without a schema validator running inside this process.
+  async "echo-thread-start"() {
+    const init = await expect("initialize");
+    replyResult(init, initializeResult);
+    await expect("initialized");
+
+    const threadStart = await expect("thread/start");
+    send({ method: "test/echo", params: { receivedThreadStart: threadStart.params } });
+    replyResult(threadStart, { thread: { id: "t1" } });
+
+    const turnStart = await expect("turn/start");
+    const threadId = turnStart.params.threadId;
+    const turnId = "u1";
+    replyResult(turnStart, { turn: { id: turnId } });
+    send({ method: "turn/started", params: threadStartedItem(threadId, turnId) });
+    await finishTurn(threadId, turnId);
+  },
+
+  // thread/resume (an "unknown to this process" threadId, as codex-reply's ensureThread sends)
+  // followed by a normal turn -- the "resume" scenario below only exercises thread/resume in
+  // isolation, so this covers codex-reply's full ensureThread-then-runTurn path.
+  async "resume-then-turn"() {
+    const init = await expect("initialize");
+    replyResult(init, initializeResult);
+    await expect("initialized");
+
+    const resume = await expect("thread/resume");
+    replyResult(resume, { thread: { id: resume.params.threadId } });
+
+    const turnStart = await expect("turn/start");
+    const threadId = turnStart.params.threadId;
+    const turnId = "u1";
+    replyResult(turnStart, { turn: { id: turnId } });
+    send({ method: "turn/started", params: threadStartedItem(threadId, turnId) });
+    await finishTurn(threadId, turnId, [{ phase: "final_answer", text: turnStart.params.input[0].text }]);
+  },
+
+  // thread/resume succeeds (as codex-reply's ensureThread expects), but turn/start itself then
+  // errors -- covers codex-reply's "runTurn rejected" path, where structuredContent.threadId
+  // must still be present since the id came from the caller, not from a thread/start we made.
+  async "resume-then-turn-start-error"() {
+    const init = await expect("initialize");
+    replyResult(init, initializeResult);
+    await expect("initialized");
+
+    const resume = await expect("thread/resume");
+    replyResult(resume, { thread: { id: resume.params.threadId } });
+
+    const turnStart = await expect("turn/start");
+    replyError(turnStart, { code: -32000, message: "turn start failed" });
+  },
+
   async resume() {
     const init = await expect("initialize");
     replyResult(init, initializeResult);
