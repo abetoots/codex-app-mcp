@@ -5,7 +5,7 @@
 > **For Claude:** Use executing-plans or subagent-driven-development to implement this plan task-by-task, after Phase 0 sign-off.
 
 **Goal:** A stdio MCP server that exposes `codex` and `codex-reply` (old names, old schema) by driving one long-lived `codex app-server --stdio` child.
-**Architecture:** `AppServerClient` frames newline-delimited JSON-RPC over the child's stdio, correlates ids, dispatches notifications, and answers server→client requests. `TurnRunner` composes `thread/start` | `thread/resume` → `turn/start` and collects `agentMessage` items until `turn/completed`. `tools.ts` maps the two MCP tools onto it and always returns `threadId`.
+**Architecture:** `AppServerClient` frames newline-delimited JSON-RPC over the child's stdio, correlates ids, dispatches notifications, and answers server→client requests. `TurnRunner` composes `thread/start` | `thread/resume` → `turn/start` and collects `agentMessage` items until `turn/completed`. `tools.ts` maps the two MCP tools onto it and returns `threadId` in every case except one: `codex` when `thread/start` itself fails, since no thread was ever created to report.
 **Tech Stack:** TypeScript (ESM, strict), Node ≥ 20, `@modelcontextprotocol/sdk` ^1.30, `zod`, Vitest; no Bun.
 
 ---
@@ -112,7 +112,7 @@ Fake server: reads JSON lines on stdin, replies from a scenario file passed via 
 
 ### Task 5: Tools + entry
 **Files:** Create `src/tools.ts`, `src/index.ts`, `tests/tools.test.ts`.
-**Tests:** schema accepts the old param names and defaults (`never`, `read-only`); `codex` result always carries `structuredContent.threadId`; `codex-reply` accepts `conversationId` alias; `isError` on failed status; lazy spawn happens on first call, and a second call after a simulated child exit respawns.
+**Tests:** schema accepts the old param names and defaults (`never`, `read-only`); `codex` result carries `structuredContent.threadId` except when `thread/start` itself fails (no thread was ever created, so there's nothing to report); `codex-reply` accepts `conversationId` alias; `isError` on failed status; lazy spawn happens on first call, and a second call after a simulated child exit respawns.
 **Entry:** `McpServer({name:"codex-app-mcp", version})`, `registerTool("codex", …)`, `registerTool("codex-reply", …)`, `StdioServerTransport`. Progress notifications via `extra.sendNotification` when `_meta.progressToken` present.
 
 ### Task 6: Live smoke + `bin/smoke.sh`

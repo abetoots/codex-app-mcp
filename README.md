@@ -43,20 +43,43 @@ Both tools mirror the removed `codex mcp-server`'s 0.151.0 interface, so
 existing skills/tooling that call `mcp__codex__codex` /
 `mcp__codex__codex-reply` need no changes.
 
-- **`codex`** — starts a new thread. Key params: `prompt` (required),
-  `model?`, `cwd?`, `approval-policy?` (`untrusted|on-failure|on-request|never`,
-  default `never`; `on-failure` is mapped to `on-request` since app-server
-  dropped it), `sandbox?` (`read-only|workspace-write|danger-full-access`,
-  default `read-only`), `config?`, `base-instructions?`,
-  `developer-instructions?`, `compact-prompt?` (folded into
-  `developer-instructions`), `timeout-seconds?` (default 900). `profile` is
-  rejected outright — app-server has no equivalent field.
-- **`codex-reply`** — continues an existing thread. Key params: `threadId`
-  (or the deprecated `conversationId` alias) and `prompt`, both required, plus
-  `timeout-seconds?`.
+### `codex` — starts a new thread (a persisted codex conversation)
 
-Both always return `content[0].text` (the final answer) and
-`structuredContent.threadId` / `turnId` / `status` / `declinedRequests`.
+| Param | Values | Default | Note |
+|---|---|---|---|
+| `prompt` | string | — | required |
+| `model` | string | — | optional |
+| `cwd` | string | server cwd | optional |
+| `approval-policy` | `untrusted \| on-failure \| on-request \| never` | `never` | `on-failure` maps to `on-request` — app-server dropped that value |
+| `sandbox` | `read-only \| workspace-write \| danger-full-access` | `read-only` | |
+| `config` | object | — | optional |
+| `base-instructions` | string | — | optional |
+| `developer-instructions` | string | — | optional |
+| `compact-prompt` | string | — | folded into `developer-instructions` |
+| `timeout-seconds` | number | `900` | |
+| `profile` | — | — | rejected outright — app-server has no equivalent field |
+
+### `codex-reply` — continues an existing thread
+
+| Param | Values | Default | Note |
+|---|---|---|---|
+| `threadId` | string | — | required, or use `conversationId` |
+| `conversationId` | string | — | deprecated alias for `threadId` |
+| `prompt` | string | — | required |
+| `timeout-seconds` | number | `900` | |
+
+### Result shape (both tools)
+
+`content[0].text` is the final answer. `structuredContent` carries
+`threadId`, `turnId`, `status`, and `declinedRequests` — the method names of
+any app-server approval/permission requests this server auto-declined,
+since it runs headless and can't grant filesystem or exec access.
+
+`structuredContent.threadId` is present in every case except one: `codex`
+when `thread/start` itself fails, before any thread has ever existed.
+There's nothing to report in that case, so no id is synthesized; `codex-reply`
+always has one, since its `threadId` comes from the caller, not from a
+`thread/start` this server made.
 
 ## Testing
 
