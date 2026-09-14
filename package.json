@@ -15,7 +15,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit",
-    "pretest": "node scripts/generate-schema.mjs",
+    "pretest": "node scripts/generate-schema.mjs && npm run build",
     "test": "vitest run",
     "smoke": "bash bin/smoke.sh"
   },

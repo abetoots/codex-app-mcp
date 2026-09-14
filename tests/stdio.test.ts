@@ -4,15 +4,14 @@
 // functions directly, never through a real MCP transport, so neither exercises zod's
 // default-filling (which only happens via McpServer.registerTool's schema conversion) or the
 // wire-level JSON-RPC framing itself.
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js";
 
-const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 const distEntry = fileURLToPath(new URL("../dist/index.js", import.meta.url));
 // CODEX_BIN only overrides the binary path in src/index.ts's defaultClientOptions(); the args
 // ["app-server", "--stdio"] are always appended, so the substitute binary must accept (or
@@ -22,11 +21,10 @@ const distEntry = fileURLToPath(new URL("../dist/index.js", import.meta.url));
 // command+args pair -- hence the executable bit and shebang on fake-app-server.mjs itself.
 const fakeServerPath = fileURLToPath(new URL("./fake-app-server.mjs", import.meta.url));
 
-beforeAll(() => {
-  // always rebuild so dist/index.js reflects the current source -- mirrors bin/smoke.sh's own
-  // "build first" rule for anything that spawns the compiled entry point.
-  execFileSync("npm", ["run", "build"], { cwd: projectRoot, stdio: "inherit" });
-}, 30_000);
+// dist/index.js is built once, before vitest even starts, by the `pretest` npm lifecycle script
+// (see package.json) -- not here. a per-file beforeAll running a blocking `tsc` compile would
+// race every other test file vitest runs in parallel, starving them of cpu and risking spurious
+// timeouts (see the 2026-09-14 finding B fix commit for the flakiness this used to cause).
 
 describe("real MCP stdio surface (node dist/index.js over stdio)", () => {
   let client: Client | undefined;
