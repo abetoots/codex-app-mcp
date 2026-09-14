@@ -206,6 +206,22 @@ const scenarios = {
     await finishTurn(threadId, turnId);
   },
 
+  // a turn that completes normally per the protocol (status:"completed") but produces zero
+  // agentMessage items -- the shape reported by a real session in the field (ledger
+  // verdict:"stale-context": codex-reply completing with only structuredContent and no text,
+  // reproducible across trivial prompts). used to verify tools.ts treats this as an error
+  // instead of silently returning an empty "success".
+  async "completed-with-no-text"() {
+    await runHandshakeAndThreadStart();
+
+    const turnStart = await expect("turn/start");
+    const threadId = turnStart.params.threadId;
+    const turnId = "u1";
+    replyResult(turnStart, { turn: { id: turnId } });
+    send({ method: "turn/started", params: threadStartedItem(threadId, turnId) });
+    await finishTurn(threadId, turnId, []);
+  },
+
   async "exit-mid-turn"() {
     await runHandshakeAndThreadStart();
 
@@ -402,6 +418,24 @@ const scenarios = {
     replyResult(turnStart, { turn: { id: turnId } });
     send({ method: "turn/started", params: threadStartedItem(threadId, turnId) });
     await finishTurn(threadId, turnId, [{ phase: "final_answer", text: turnStart.params.input[0].text }]);
+  },
+
+  // codex-reply's exact reported field failure: an existing thread, resumed, whose turn
+  // completes with status:"completed" but zero agentMessage items.
+  async "resume-then-empty-turn"() {
+    const init = await expect("initialize");
+    replyResult(init, initializeResult);
+    await expect("initialized");
+
+    const resume = await expect("thread/resume");
+    replyResult(resume, { thread: { id: resume.params.threadId } });
+
+    const turnStart = await expect("turn/start");
+    const threadId = turnStart.params.threadId;
+    const turnId = "u1";
+    replyResult(turnStart, { turn: { id: turnId } });
+    send({ method: "turn/started", params: threadStartedItem(threadId, turnId) });
+    await finishTurn(threadId, turnId, []);
   },
 
   // thread/resume succeeds (as codex-reply's ensureThread expects), but turn/start itself then

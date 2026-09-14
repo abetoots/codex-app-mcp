@@ -86,6 +86,25 @@ describe("codex tool", () => {
     });
   });
 
+  it("a turn that completes with zero text is treated as an error, not a silent empty success", async () => {
+    const runner = await makeRunner("completed-with-no-text");
+    const tool = createCodexTool(runner);
+
+    const result = await tool.handler(defaultCodexInput, asExtra(fakeExtra()));
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text.length).toBeGreaterThan(0);
+    expect((result.content[0] as { text: string }).text).toMatch(/no text|stale|empty/i);
+    expect(result.structuredContent).toMatchObject({
+      threadId: "t1",
+      turnId: "u1",
+      status: "completed",
+      declinedRequests: [],
+    });
+    // structuredContent must explain the failure, not just report status:"completed" bare
+    expect(typeof (result.structuredContent as { errorText?: unknown }).errorText).toBe("string");
+  });
+
   it("rejects `profile` without ever calling the TurnRunner", async () => {
     const startThread = vi.fn();
     const runTurn = vi.fn();
@@ -241,6 +260,18 @@ describe("codex-reply tool", () => {
     expect(result.isError).toBeFalsy();
     expect(result.content).toEqual([{ type: "text", text: "what did you say?" }]);
     expect(result.structuredContent).toMatchObject({ threadId: "old-thread", status: "completed" });
+  });
+
+  it("a resumed turn that completes with zero text is treated as an error, matching the codex tool's behavior", async () => {
+    const runner = await makeRunner("resume-then-empty-turn");
+    const tool = createCodexReplyTool(runner);
+
+    const result = await tool.handler({ ...defaultReplyInput, threadId: "old-thread" }, asExtra(fakeExtra()));
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toMatch(/no text|stale|empty/i);
+    expect(result.structuredContent).toMatchObject({ threadId: "old-thread", status: "completed" });
+    expect(typeof (result.structuredContent as { errorText?: unknown }).errorText).toBe("string");
   });
 
   it("honors the deprecated conversationId alias when threadId is absent", async () => {

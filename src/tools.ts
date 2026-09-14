@@ -42,6 +42,22 @@ const COMPACT_PROMPT_NOTE =
 
 const SYNTHETIC_INTERRUPTED_TEXT = "turn was interrupted after timeout";
 
+// a "completed" turn whose final text is empty/whitespace-only is treated as an error, not an
+// ordinary success. Observed in the field (ledger verdict:"stale-context", 2026-09-14): codex
+// tool calls, including trivial one-word prompts, repeatedly returned only the structuredContent
+// envelope with zero assistant text and no error -- an LLM turn producing literally nothing is
+// almost never intentional, and letting it through as a normal success would let a caller (e.g.
+// a multi-model skill's verdict protocol) silently treat a stale/degraded leg as a real,
+// contentless "no objections" answer instead of a failure worth surfacing.
+const EMPTY_COMPLETION_TEXT =
+  "the turn completed but produced no text response -- this usually indicates a stale or " +
+  "degraded app-server session (e.g. after a prior usage-limit error) rather than a genuine " +
+  "empty answer. Retry, or start a fresh `codex` thread instead of continuing this one.";
+
+function isEmptyCompletion(turnResult: TurnResult): boolean {
+  return turnResult.status === "completed" && turnResult.text.trim() === "";
+}
+
 const APPROVAL_POLICY_MAP = {
   untrusted: "untrusted",
   "on-request": "on-request",
@@ -56,7 +72,7 @@ const APPROVAL_POLICY_MAP = {
 function buildContentText(turnResult: TurnResult, notes: string[]): string {
   const parts = [...notes];
   if (turnResult.status === "completed") {
-    parts.push(turnResult.text);
+    parts.push(isEmptyCompletion(turnResult) ? EMPTY_COMPLETION_TEXT : turnResult.text);
   } else {
     const errorText = turnResult.errorText ?? SYNTHETIC_INTERRUPTED_TEXT;
     parts.push(turnResult.text ? `${turnResult.text}\n\n${errorText}` : errorText);
@@ -72,6 +88,7 @@ function buildStructuredContent(turnResult: TurnResult): Record<string, unknown>
     declinedRequests: turnResult.declinedRequests,
   };
   if (turnResult.errorText !== undefined) structuredContent.errorText = turnResult.errorText;
+  else if (isEmptyCompletion(turnResult)) structuredContent.errorText = EMPTY_COMPLETION_TEXT;
   return structuredContent;
 }
 
@@ -80,7 +97,7 @@ function buildToolResult(turnResult: TurnResult, notes: string[]): CallToolResul
     content: [{ type: "text", text: buildContentText(turnResult, notes) }],
     structuredContent: buildStructuredContent(turnResult),
   };
-  if (turnResult.status !== "completed") result.isError = true;
+  if (turnResult.status !== "completed" || isEmptyCompletion(turnResult)) result.isError = true;
   return result;
 }
 
