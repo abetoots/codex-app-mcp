@@ -458,6 +458,37 @@ const scenarios = {
     await finishTurn(threadId, turnIdB, [{ phase: "final_answer", text: "real-B" }]);
   },
 
+  // reproduces the turnId-visibility race: the turn/start response and this same turn's first
+  // genuine item/completed + turn/completed notifications are written in one single
+  // process.stdout.write() call (not through send(), which would be multiple separate writes),
+  // so they are guaranteed to land in the client's stdout as one chunk. a client that only
+  // learns turnId via a .then() callback on turn/start's promise sees these notifications
+  // dispatched synchronously, in the same tick, before that microtask runs -- so turnId is
+  // still undefined when they're checked, and both get dropped.
+  async "turn-start-same-chunk-as-event"() {
+    await runHandshakeAndThreadStart();
+
+    const turnStart = await expect("turn/start");
+    const threadId = turnStart.params.threadId;
+    const turnId = "u1";
+
+    const lines = [
+      { jsonrpc: "2.0", id: turnStart.id, result: { turn: { id: turnId } } },
+      { jsonrpc: "2.0", method: "turn/started", params: threadStartedItem(threadId, turnId) },
+      {
+        jsonrpc: "2.0",
+        method: "item/completed",
+        params: {
+          threadId,
+          turnId,
+          item: { id: "item-1", type: "agentMessage", phase: "final_answer", text: "same-chunk" },
+        },
+      },
+      { jsonrpc: "2.0", method: "turn/completed", params: { threadId, turn: { id: turnId, status: "completed" } } },
+    ];
+    process.stdout.write(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+  },
+
   // thread/resume itself returns a JSON-RPC error -- covers codex-reply's ensureThread failing
   // before any turn/start is ever attempted, unlike "resume-then-turn-start-error" which fails
   // later, after a successful resume.

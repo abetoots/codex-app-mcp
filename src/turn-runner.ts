@@ -233,26 +233,34 @@ export class TurnRunner {
       disposers.push(this.client.onExit((err: AppServerExited) => fail(err)));
 
       this.client
-        .request<{ turn: { id: string } }>(CLIENT_REQUESTS.turnStart, {
-          threadId,
-          input: [{ type: "text", text: prompt }],
-        })
-        .then((result) => {
-          turnId = result.turn.id;
-          timeoutHandle = setTimeout(() => {
-            const interruptTurnId = turnId as string;
-            void this.client.request(CLIENT_REQUESTS.turnInterrupt, { threadId, turnId: interruptTurnId }).catch(() => {
-              // best effort -- we're synthesizing the result below regardless
-            });
-            finish({
-              threadId,
-              turnId: interruptTurnId,
-              status: "interrupted",
-              text: selectFinalText(messages),
-              declinedRequests,
-            });
-          }, timeoutMs);
-        })
+        .request<{ turn: { id: string } }>(
+          CLIENT_REQUESTS.turnStart,
+          { threadId, input: [{ type: "text", text: prompt }] },
+          // onSettled, NOT .then(): it runs synchronously the instant turn/start's response is
+          // parsed, before any microtask. a stdout chunk (or run of chunks processed before the
+          // microtask queue drains) can contain this response line immediately followed by this
+          // same turn's own item/completed/turn/completed notification -- onStdoutData dispatches
+          // notifications synchronously, in order, in the same loop. a .then() callback would
+          // still be queued (not yet run) when that notification is dispatched, so turnId would
+          // still read undefined and extractAgentMessage/extractCompletedTurn would drop the
+          // event. setting turnId here closes that gap.
+          (result) => {
+            turnId = result.turn.id;
+            timeoutHandle = setTimeout(() => {
+              const interruptTurnId = turnId as string;
+              void this.client.request(CLIENT_REQUESTS.turnInterrupt, { threadId, turnId: interruptTurnId }).catch(() => {
+                // best effort -- we're synthesizing the result below regardless
+              });
+              finish({
+                threadId,
+                turnId: interruptTurnId,
+                status: "interrupted",
+                text: selectFinalText(messages),
+                declinedRequests,
+              });
+            }, timeoutMs);
+          },
+        )
         .catch((err: Error) => fail(err));
     });
   }

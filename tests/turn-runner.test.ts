@@ -270,6 +270,19 @@ describe("turnId correlation across a timed-out turn and its successor", () => {
   });
 });
 
+describe("turnId visibility for same-chunk notifications", () => {
+  it("does not drop item/completed and turn/completed written in the same chunk as turn/start's response", async () => {
+    const runner = await makeRunner("turn-start-same-chunk-as-event");
+    const { threadId } = await runner.startThread(readOnlySettings);
+
+    const result = await withTimeout(runner.runTurn(threadId, "hi"), 2000, "runTurn");
+
+    expect(result.status).toBe("completed");
+    expect(result.turnId).toBe("u1");
+    expect(result.text).toBe("same-chunk");
+  });
+});
+
 describe("ensureThread", () => {
   it("resumes an unknown thread id (fresh process) via thread/resume", async () => {
     const runner = await makeRunner("resume");

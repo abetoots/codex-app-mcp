@@ -50,6 +50,11 @@ type ExitHandler = (err: AppServerExited) => void;
 interface PendingRequest {
   resolve: (result: unknown) => void;
   reject: (err: Error) => void;
+  // invoked synchronously from settlePending, the instant a matching *successful* response line
+  // is parsed -- strictly before `resolve` schedules the promise's .then() callbacks as
+  // microtasks. exists so a caller can observe the result before any later, synchronous
+  // notification dispatch in the same onStdoutData loop/chunk -- see request()'s doc comment.
+  onSettled?: (result: unknown) => void;
 }
 
 interface IncomingMessage {
@@ -119,8 +124,18 @@ export class AppServerClient {
     }
   }
 
-  // sends a request; queues until initialize() has completed the handshake
-  request<T = unknown>(method: string, params?: unknown): Promise<T> {
+  // sends a request; queues until initialize() has completed the handshake.
+  //
+  // `onSettled`, when given, is called synchronously the instant a *successful* response for
+  // this request is parsed off the wire -- before the returned promise's .then()/await
+  // continuations run (those are always deferred to a microtask, even for an already-resolved
+  // promise). onStdoutData processes every line in a chunk synchronously and in order, so a
+  // notification for this same request's effect (e.g. a turn's own item/completed) can be
+  // dispatched later in that same synchronous loop, before any microtask gets a chance to run.
+  // anything that must be visible to such same-chunk notification dispatch belongs in
+  // `onSettled`, not in a `.then()` on the returned promise. not called on an error response --
+  // use .catch()/await+try for that, exactly as before.
+  request<T = unknown>(method: string, params?: unknown, onSettled?: (result: T) => void): Promise<T> {
     if (!this.initialized) {
       return new Promise<T>((resolve, reject) => {
         this.queuedBeforeInit.push((failure) => {
@@ -128,11 +143,11 @@ export class AppServerClient {
             reject(failure);
             return;
           }
-          this.sendRequest<T>(method, params).then(resolve, reject);
+          this.sendRequest<T>(method, params, onSettled).then(resolve, reject);
         });
       });
     }
-    return this.sendRequest<T>(method, params);
+    return this.sendRequest<T>(method, params, onSettled);
   }
 
   // fire-and-forget notification to the app-server
@@ -169,11 +184,15 @@ export class AppServerClient {
     this.child.kill();
   }
 
-  private sendRequest<T>(method: string, params?: unknown): Promise<T> {
+  private sendRequest<T>(method: string, params?: unknown, onSettled?: (result: T) => void): Promise<T> {
     if (this.exited) return Promise.reject(new AppServerExited(null, null));
     const id = this.nextId++;
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (result: unknown) => void, reject });
+      this.pending.set(id, {
+        resolve: resolve as (result: unknown) => void,
+        reject,
+        onSettled: onSettled as ((result: unknown) => void) | undefined,
+      });
       this.write({ id, method, params });
     });
   }
@@ -227,6 +246,8 @@ export class AppServerClient {
     if (message.error) {
       pending.reject(new AppServerRpcError(message.error.code, message.error.message, message.error.data));
     } else {
+      // synchronous, and strictly before resolve() -- see onSettled's doc comment on request().
+      pending.onSettled?.(message.result);
       pending.resolve(message.result);
     }
   }
