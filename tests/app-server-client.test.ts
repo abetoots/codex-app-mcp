@@ -164,4 +164,21 @@ describe("AppServerClient", () => {
 
     expect(result).toEqual({ thread: { id: "t1" } });
   });
+
+  it("a throwing onSettled callback rejects the request instead of crashing the client", async () => {
+    const client = tracked("happy");
+    await client.initialize();
+    const boom = new Error("onSettled boom");
+
+    await expect(
+      client.request(CLIENT_REQUESTS.threadStart, clientRequests.threadStart.params, () => {
+        throw boom;
+      }),
+    ).rejects.toBe(boom);
+
+    // the onStdoutData loop and this.pending map must still be intact afterward -- the next
+    // request the "happy" scenario actually expects (turn/start) must still succeed normally.
+    const result = await client.request(CLIENT_REQUESTS.turnStart, clientRequests.turnStart.params);
+    expect(result).toEqual({ turn: { id: "u1" } });
+  });
 });

@@ -247,7 +247,15 @@ export class AppServerClient {
       pending.reject(new AppServerRpcError(message.error.code, message.error.message, message.error.data));
     } else {
       // synchronous, and strictly before resolve() -- see onSettled's doc comment on request().
-      pending.onSettled?.(message.result);
+      // this runs inside the child's stdout 'data' handler, so a throw here would otherwise
+      // escape as an uncaught exception and crash the whole process instead of just failing
+      // this one request -- route it through reject() the same way a bad response would be.
+      try {
+        pending.onSettled?.(message.result);
+      } catch (err) {
+        pending.reject(err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
       pending.resolve(message.result);
     }
   }
