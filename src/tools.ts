@@ -49,6 +49,19 @@ const SYNTHETIC_INTERRUPTED_TEXT = "turn was interrupted after timeout";
 // almost never intentional, and letting it through as a normal success would let a caller (e.g.
 // a multi-model skill's verdict protocol) silently treat a stale/degraded leg as a real,
 // contentless "no objections" answer instead of a failure worth surfacing.
+//
+// This is a confirmed, still-open upstream app-server bug class, not speculation: see
+// openai/codex#25619 ("app-server: silent turn/completed(last_agent_message=null) when
+// run_turn early-returns after compaction failure" -- the issue reporter explicitly confirms
+// this is app-server-specific, distinct from a related but separately-caused codex-exec issue,
+// openai/codex#24536). Live reproduction of #25619 was attempted (four tries: two matching
+// openai/codex#45361's config-override-hang repro exactly, two escalating attempts to force a
+// context-full/compaction-failure state via a tiny model_context_window override and then a
+// genuinely large ~76k-token prompt) and did not trigger either bug -- the real context window
+// here clamps to 258,400 tokens (matching openai/codex#16068's report of that same clamp), and
+// per #25619 itself, reaching context-full doesn't reliably trigger the *failure* branch of
+// compaction, only sometimes. The fix here doesn't depend on reproducing the exact trigger: it
+// treats the symptom (empty text on a reported success) as untrustworthy regardless of cause.
 const EMPTY_COMPLETION_TEXT =
   "the turn completed but produced no text response -- this usually indicates a stale or " +
   "degraded app-server session (e.g. after a prior usage-limit error) rather than a genuine " +
