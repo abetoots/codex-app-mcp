@@ -81,9 +81,22 @@ There's nothing to report in that case, so no id is synthesized; `codex-reply`
 always has one, since its `threadId` comes from the caller, not from a
 `thread/start` this server made.
 
+## Updating this server
+
+After `git pull` (or any local fix) + `npm run build`, **restart or reconnect any Claude
+Code session that already had this server connected** — a running Node process doesn't
+pick up a rebuilt `dist/` on its own; it keeps serving whatever was on disk when Claude
+Code spawned it. In Claude Code, open the `/mcp` panel, find `codex`, and choose
+**Reconnect** (discards the cached tool list and respawns the process; no full session
+restart needed). Confirmed live (2026-09-15) as the actual cause of an already-fixed bug
+appearing to recur across sessions that predated the fix.
+
+To check which version a running server is on, look at its stderr: it logs
+`[codex-app-mcp] starting vX.Y.Z (pid N)` on every startup.
+
 ## Testing
 
-- `npm test` runs the full suite (67 tests) against `tests/fake-app-server.mjs`,
+- `npm test` runs the full suite (78 tests) against `tests/fake-app-server.mjs`,
   a scripted stand-in for `codex app-server`. Fast, no network, no auth
   needed — this is what CI/every commit should run.
 - `bin/smoke.sh` (or `CODEX_LIVE=1 npm run smoke`) runs a real end-to-end

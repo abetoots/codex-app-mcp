@@ -5,6 +5,7 @@
 // default-filling (which only happens via McpServer.registerTool's schema conversion) or the
 // wire-level JSON-RPC framing itself.
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -49,6 +50,35 @@ describe("real MCP stdio surface (node dist/index.js over stdio)", () => {
   afterEach(async () => {
     await client?.close();
     client = undefined;
+  });
+
+  it("logs a startup banner with its own version to stderr", async () => {
+    // a long-lived process doesn't hot-reload after a rebuild -- this banner is the diagnostic
+    // for that (confirmed live, 2026-09-15: two field reports of already-fixed behavior
+    // recurring, both traced to a stale already-running server process). guards against the
+    // banner silently regressing, and against McpServer's advertised version drifting from
+    // package.json's (it used to be a separate hardcoded literal).
+    const pkgVersion = JSON.parse(readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"))
+      .version as string;
+
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [distEntry],
+      env: stdioEnv("happy"),
+      stderr: "pipe",
+    });
+    let stderrText = "";
+    transport.stderr?.on("data", (chunk: Buffer) => {
+      stderrText += chunk.toString("utf8");
+    });
+
+    const c = new Client({ name: "stdio-test-client", version: "0.0.0" });
+    await c.connect(transport);
+    client = c;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(stderrText).toContain(`[codex-app-mcp] starting v${pkgVersion} (pid `);
+    expect(c.getServerVersion()?.version).toBe(pkgVersion);
   });
 
   it("lists codex and codex-reply with schemas reflecting the documented defaults", async () => {
