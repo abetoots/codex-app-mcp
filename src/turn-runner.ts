@@ -31,6 +31,10 @@ export interface TurnResult {
   text: string;
   errorText?: string;
   declinedRequests: string[];
+  // every `error` notification app-server sent during this turn, in arrival order. always
+  // present (possibly empty) -- see extractUpstreamError's comment for why this is captured
+  // instead of discarded, even for a turn that otherwise completed successfully.
+  upstreamErrors: { message: string; code?: string }[];
 }
 
 const DEFAULT_TIMEOUT_MS = 900_000; // 15 minutes
@@ -79,6 +83,37 @@ function extractCompletedTurn(params: unknown, threadId: string, turnId: string 
   if (p?.threadId !== threadId || !p.turn) return undefined;
   if (p.turn.id !== turnId) return undefined;
   return p.turn;
+}
+
+// same turnId-scoping discipline as the two extractors above: an `error` notification for a
+// stale, timed-out turn must not be attributed to its successor on the same thread.
+//
+// this notification used to be discarded entirely (a bare `error` is never terminal by itself
+// -- turn/completed is the only thing that ends a turn, per the app-server v2 schema -- so there
+// was "nothing to do" with it). that was wrong: when a turn completes with status:"completed"
+// but zero text, this is the one piece of evidence app-server sends explaining why, and
+// `codexErrorInfo` carries a structured, machine-readable reason (usageLimitExceeded,
+// rateLimitExceeded, contextWindowExceeded, sessionBudgetExceeded, ...) when the upstream error
+// is one of those. Capturing it turns a silent, undiagnosable failure into one with real
+// evidence -- see tools.ts's isEmptyCompletion handling, which surfaces this to the caller.
+function extractUpstreamError(
+  params: unknown,
+  threadId: string,
+  turnId: string | undefined,
+): { message: string; code?: string } | undefined {
+  const p = params as {
+    threadId?: string;
+    turnId?: string;
+    error?: { message?: string; codexErrorInfo?: unknown };
+  };
+  if (p?.threadId !== threadId || p?.turnId !== turnId) return undefined;
+  const message = p.error?.message;
+  if (typeof message !== "string") return undefined;
+  // codexErrorInfo is a oneOf: either a plain string enum (usageLimitExceeded, etc.) or an
+  // object variant carrying an httpStatusCode. only the string form maps cleanly to a `code`;
+  // the object form is left out rather than guessed at.
+  const code = typeof p.error?.codexErrorInfo === "string" ? p.error.codexErrorInfo : undefined;
+  return code !== undefined ? { message, code } : { message };
 }
 
 export class TurnRunner {
@@ -168,6 +203,7 @@ export class TurnRunner {
     this.activeDeclines.set(threadId, declinedRequests);
 
     const messages: AgentMessage[] = [];
+    const upstreamErrors: { message: string; code?: string }[] = [];
     let turnId: string | undefined;
     let settled = false;
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
@@ -217,18 +253,34 @@ export class TurnRunner {
               text: "",
               errorText: turn.error?.message ?? "turn failed",
               declinedRequests,
+              upstreamErrors,
             });
             return;
           }
           const status = turn.status === "interrupted" ? "interrupted" : "completed";
-          finish({ threadId, turnId: turn.id, status, text: selectFinalText(messages), declinedRequests });
+          finish({
+            threadId,
+            turnId: turn.id,
+            status,
+            text: selectFinalText(messages),
+            declinedRequests,
+            upstreamErrors,
+          });
         }),
       );
 
       // a bare `error` notification (willRetry true or false) is never terminal by itself in
       // the app-server v2 schema -- a turn only ends via turn/completed, which reports
-      // status:"failed" when it doesn't recover. so there's nothing to do here; retries just
-      // keep the turn running until turn/completed arrives.
+      // status:"failed" when it doesn't recover, so this alone never calls finish()/fail().
+      // it IS captured, though (see extractUpstreamError) rather than discarded: it's the one
+      // piece of evidence app-server sends when a turn later completes successfully but with no
+      // text, and retries just keep the turn running until turn/completed arrives regardless.
+      disposers.push(
+        this.client.on(SERVER_NOTIFICATIONS.error, (params) => {
+          const upstreamError = extractUpstreamError(params, threadId, turnId);
+          if (upstreamError) upstreamErrors.push(upstreamError);
+        }),
+      );
 
       disposers.push(this.client.onExit((err: AppServerExited) => fail(err)));
 
@@ -257,6 +309,7 @@ export class TurnRunner {
                 status: "interrupted",
                 text: selectFinalText(messages),
                 declinedRequests,
+                upstreamErrors,
               });
             }, timeoutMs);
           },

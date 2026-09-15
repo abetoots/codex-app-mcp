@@ -206,6 +206,33 @@ const scenarios = {
     await finishTurn(threadId, turnId);
   },
 
+  // the field-reported shape with its likely real cause attached: app-server sends a
+  // structured error notification (codexErrorInfo:"usageLimitExceeded") mid-turn, does NOT
+  // retry, and still reports turn/completed{status:"completed"} with zero agentMessage items --
+  // usage billed, nothing returned. Used to verify TurnRunner surfaces this real upstream
+  // reason instead of silently discarding the error notification (which it did until this fix).
+  async "usage-limit-then-empty"() {
+    await runHandshakeAndThreadStart();
+
+    const turnStart = await expect("turn/start");
+    const threadId = turnStart.params.threadId;
+    const turnId = "u1";
+    replyResult(turnStart, { turn: { id: turnId } });
+    send({ method: "turn/started", params: threadStartedItem(threadId, turnId) });
+
+    send({
+      method: "error",
+      params: {
+        threadId,
+        turnId,
+        error: { message: "You've hit your usage limit.", codexErrorInfo: "usageLimitExceeded" },
+        willRetry: false,
+      },
+    });
+
+    await finishTurn(threadId, turnId, []);
+  },
+
   // a turn that completes normally per the protocol (status:"completed") but produces zero
   // agentMessage items -- the shape reported by a real session in the field (ledger
   // verdict:"stale-context": codex-reply completing with only structuredContent and no text,
@@ -478,7 +505,19 @@ const scenarios = {
     send({ method: "turn/started", params: threadStartedItem(threadId, turnIdB) });
 
     // A's late events arrive only now, after B's turnId is already known client-side --
-    // these must be ignored, not mistaken for B's own completion
+    // these must be ignored, not mistaken for B's own completion. includes a stale error
+    // notification alongside the stale item/completed: like message/completion correlation,
+    // an error notification must be turnId-scoped too, or A's error would wrongly show up in
+    // B's upstreamErrors.
+    send({
+      method: "error",
+      params: {
+        threadId,
+        turnId: turnIdA,
+        error: { message: "STALE-A error, must not reach B", codexErrorInfo: "usageLimitExceeded" },
+        willRetry: false,
+      },
+    });
     send({
       method: "item/completed",
       params: {

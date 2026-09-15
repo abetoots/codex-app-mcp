@@ -71,6 +71,15 @@ function isEmptyCompletion(turnResult: TurnResult): boolean {
   return turnResult.status === "completed" && turnResult.text.trim() === "";
 }
 
+// when app-server sent a real error notification during the turn (see TurnRunner's
+// extractUpstreamError), surface that actual reason instead of the generic guess above --
+// this is what turns a silent, undiagnosable failure into one with real evidence next time.
+function emptyCompletionText(turnResult: TurnResult): string {
+  if (turnResult.upstreamErrors.length === 0) return EMPTY_COMPLETION_TEXT;
+  const reasons = turnResult.upstreamErrors.map((e) => (e.code ? `${e.code}: ${e.message}` : e.message)).join("\n");
+  return `the turn completed but produced no text response. app-server reported:\n${reasons}`;
+}
+
 const APPROVAL_POLICY_MAP = {
   untrusted: "untrusted",
   "on-request": "on-request",
@@ -85,7 +94,7 @@ const APPROVAL_POLICY_MAP = {
 function buildContentText(turnResult: TurnResult, notes: string[]): string {
   const parts = [...notes];
   if (turnResult.status === "completed") {
-    parts.push(isEmptyCompletion(turnResult) ? EMPTY_COMPLETION_TEXT : turnResult.text);
+    parts.push(isEmptyCompletion(turnResult) ? emptyCompletionText(turnResult) : turnResult.text);
   } else {
     const errorText = turnResult.errorText ?? SYNTHETIC_INTERRUPTED_TEXT;
     parts.push(turnResult.text ? `${turnResult.text}\n\n${errorText}` : errorText);
@@ -99,9 +108,10 @@ function buildStructuredContent(turnResult: TurnResult): Record<string, unknown>
     turnId: turnResult.turnId,
     status: turnResult.status,
     declinedRequests: turnResult.declinedRequests,
+    upstreamErrors: turnResult.upstreamErrors,
   };
   if (turnResult.errorText !== undefined) structuredContent.errorText = turnResult.errorText;
-  else if (isEmptyCompletion(turnResult)) structuredContent.errorText = EMPTY_COMPLETION_TEXT;
+  else if (isEmptyCompletion(turnResult)) structuredContent.errorText = emptyCompletionText(turnResult);
   return structuredContent;
 }
 

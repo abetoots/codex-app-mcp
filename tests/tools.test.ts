@@ -105,6 +105,22 @@ describe("codex tool", () => {
     expect(typeof (result.structuredContent as { errorText?: unknown }).errorText).toBe("string");
   });
 
+  it("surfaces the real upstream reason (not the generic guess) when app-server sent one", async () => {
+    const runner = await makeRunner("usage-limit-then-empty");
+    const tool = createCodexTool(runner);
+
+    const result = await tool.handler(defaultCodexInput, asExtra(fakeExtra()));
+
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("usageLimitExceeded");
+    expect(text).toContain("You've hit your usage limit.");
+    expect(result.structuredContent).toMatchObject({
+      upstreamErrors: [{ message: "You've hit your usage limit.", code: "usageLimitExceeded" }],
+    });
+    expect((result.structuredContent as { errorText: string }).errorText).toContain("usageLimitExceeded");
+  });
+
   it("rejects `profile` without ever calling the TurnRunner", async () => {
     const startThread = vi.fn();
     const runTurn = vi.fn();

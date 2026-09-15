@@ -69,6 +69,7 @@ describe("TurnRunner happy path", () => {
       status: "completed",
       text: "pong",
       declinedRequests: [],
+      upstreamErrors: [],
     });
   });
 });
@@ -160,6 +161,7 @@ describe("failed turns", () => {
       text: "",
       errorText: "boom",
       declinedRequests: [],
+      upstreamErrors: [],
     });
   });
 });
@@ -185,6 +187,35 @@ describe("retryable error notification", () => {
 
     expect(result.status).toBe("completed");
     expect(result.text).toBe("pong");
+  });
+});
+
+describe("upstream error notifications are captured, not discarded", () => {
+  it("surfaces a usageLimitExceeded error notification on an otherwise-empty completed turn", async () => {
+    const runner = await makeRunner("usage-limit-then-empty");
+    const { threadId } = await runner.startThread(readOnlySettings);
+
+    const result = await runner.runTurn(threadId, "hi");
+
+    // the turn genuinely reports status:"completed" with no text -- this is not treated as a
+    // TurnRunner-level failure (that judgment call belongs to tools.ts, per isEmptyCompletion);
+    // what TurnRunner must not do is silently drop the one real diagnostic app-server sent.
+    expect(result.status).toBe("completed");
+    expect(result.text).toBe("");
+    expect(result.upstreamErrors).toEqual([
+      { message: "You've hit your usage limit.", code: "usageLimitExceeded" },
+    ]);
+  });
+
+  it("also captures a non-fatal retryable error notification (willRetry:true) as an upstreamError, without treating it as failure", async () => {
+    const runner = await makeRunner("retryable-error");
+    const { threadId } = await runner.startThread(readOnlySettings);
+
+    const result = await runner.runTurn(threadId, "hi");
+
+    expect(result.status).toBe("completed");
+    expect(result.text).toBe("pong");
+    expect(result.upstreamErrors).toEqual([{ message: "hiccup, retrying", code: undefined }]);
   });
 });
 
@@ -267,6 +298,9 @@ describe("turnId correlation across a timed-out turn and its successor", () => {
     expect(resultB.status).toBe("completed");
     expect(resultB.turnId).toBe("uB");
     expect(resultB.text).toBe("real-B");
+    // A's stale error notification must not appear in B's upstreamErrors either -- same
+    // turnId-scoping discipline as item/completed and turn/completed above.
+    expect(resultB.upstreamErrors).toEqual([]);
   });
 });
 
