@@ -70,16 +70,14 @@ existing skills/tooling that call `mcp__codex__codex` /
 
 ### Result shape (both tools)
 
-`content[0].text` is the final answer. `structuredContent` carries
-`threadId`, `turnId`, `status`, and `declinedRequests` — the method names of
-any app-server approval/permission requests this server auto-declined,
-since it runs headless and can't grant filesystem or exec access.
-
-`structuredContent.threadId` is present in every case except one: `codex`
-when `thread/start` itself fails, before any thread has ever existed.
-There's nothing to report in that case, so no id is synthesized; `codex-reply`
-always has one, since its `threadId` comes from the caller, not from a
-`thread/start` this server made.
+`content[0].text` is the final answer, and `structuredContent.content` carries the
+same text. The duplication is deliberate: Claude Code shows the calling model only
+`structuredContent` when both are present, so an answer that lives only in
+`content` is invisible to it. `structuredContent` also carries `threadId`,
+`turnId`, `status`, `declinedRequests` (approval requests this server
+auto-declined, since it runs headless), and `upstreamErrors` (any error
+notifications app-server sent during the turn). `threadId` is absent only when
+`thread/start` itself fails.
 
 ## Updating this server
 
@@ -96,7 +94,7 @@ To check which version a running server is on, look at its stderr: it logs
 
 ## Testing
 
-- `npm test` runs the full suite (78 tests) against `tests/fake-app-server.mjs`,
+- `npm test` runs the full suite (82 tests) against `tests/fake-app-server.mjs`,
   a scripted stand-in for `codex app-server`. Fast, no network, no auth
   needed — this is what CI/every commit should run.
 - `bin/smoke.sh` (or `CODEX_LIVE=1 npm run smoke`) runs a real end-to-end

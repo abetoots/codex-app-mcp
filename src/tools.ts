@@ -50,6 +50,11 @@ const SYNTHETIC_INTERRUPTED_TEXT = "turn was interrupted after timeout";
 // a multi-model skill's verdict protocol) silently treat a stale/degraded leg as a real,
 // contentless "no objections" answer instead of a failure worth surfacing.
 //
+// CORRECTION (2026-10-07): the field reports cited above were NOT this case. codex had returned
+// text every time; claude code dropped it because structuredContent lacked a `content` mirror
+// (see buildStructuredContent). this guard stays, since a genuinely empty completion is still a
+// real upstream possibility (below), but it never fired for those reports.
+//
 // This is a confirmed, still-open upstream app-server bug class, not speculation: see
 // openai/codex#25619 ("app-server: silent turn/completed(last_agent_message=null) when
 // run_turn early-returns after compaction failure" -- the issue reporter explicitly confirms
@@ -102,8 +107,15 @@ function buildContentText(turnResult: TurnResult, notes: string[]): string {
   return parts.filter((part) => part.length > 0).join("\n\n");
 }
 
-function buildStructuredContent(turnResult: TurnResult): Record<string, unknown> {
+// `content` mirrors the same text returned in the MCP `content` block. the original codex
+// mcp-server did this on purpose (codex_tool_runner.rs, rust-v0.151.0: "Some MCP clients ignore
+// `content` when `structuredContent` is present, so mirror the text there as well"), and claude
+// code is one of those clients: without the mirror the calling model sees only the metadata
+// envelope and no answer. omitting it was the root cause of every "completed with no text"
+// field report between 2026-09-14 and 2026-10-07 -- codex had answered each time.
+function buildStructuredContent(turnResult: TurnResult, contentText: string): Record<string, unknown> {
   const structuredContent: Record<string, unknown> = {
+    content: contentText,
     threadId: turnResult.threadId,
     turnId: turnResult.turnId,
     status: turnResult.status,
@@ -116,9 +128,10 @@ function buildStructuredContent(turnResult: TurnResult): Record<string, unknown>
 }
 
 function buildToolResult(turnResult: TurnResult, notes: string[]): CallToolResult {
+  const contentText = buildContentText(turnResult, notes);
   const result: CallToolResult = {
-    content: [{ type: "text", text: buildContentText(turnResult, notes) }],
-    structuredContent: buildStructuredContent(turnResult),
+    content: [{ type: "text", text: contentText }],
+    structuredContent: buildStructuredContent(turnResult, contentText),
   };
   if (turnResult.status !== "completed" || isEmptyCompletion(turnResult)) result.isError = true;
   return result;
@@ -134,7 +147,7 @@ function errorMessage(err: unknown): string {
 function buildRejectedResult(err: unknown, threadId: string | undefined, notes: string[]): CallToolResult {
   const message = errorMessage(err);
   const text = [...notes, message].filter((part) => part.length > 0).join("\n\n");
-  const structuredContent: Record<string, unknown> = { errorText: message };
+  const structuredContent: Record<string, unknown> = { content: text, errorText: message };
   if (threadId !== undefined) structuredContent.threadId = threadId;
   return { isError: true, content: [{ type: "text", text }], structuredContent };
 }

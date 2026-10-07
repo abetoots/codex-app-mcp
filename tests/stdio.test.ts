@@ -81,6 +81,20 @@ describe("real MCP stdio surface (node dist/index.js over stdio)", () => {
     expect(c.getServerVersion()?.version).toBe(pkgVersion);
   });
 
+  it("mirrors the answer text into structuredContent.content, since some clients drop content when structuredContent is present", async () => {
+    // the original codex mcp-server did this deliberately (codex_tool_runner.rs, rust-v0.151.0:
+    // "Some MCP clients ignore `content` when `structuredContent` is present, so mirror the
+    // text there as well"). claude code is such a client: without the mirror the calling model
+    // sees only {threadId, turnId, status} and no answer -- the root cause of every
+    // "completed with no text" field report from 2026-09-14 through 2026-10-07.
+    const c = await connect("happy");
+
+    const result = await c.callTool({ name: "codex", arguments: { prompt: "hi" } });
+
+    expect(result.content).toEqual([{ type: "text", text: "pong" }]);
+    expect(result.structuredContent).toMatchObject({ threadId: "t1", content: "pong" });
+  });
+
   it("lists codex and codex-reply with schemas reflecting the documented defaults", async () => {
     const c = await connect("happy");
 
