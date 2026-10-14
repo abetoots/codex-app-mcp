@@ -22,6 +22,11 @@ export interface StartThreadOptions extends ThreadSettings {
 
 export interface RunTurnOptions {
   timeoutMs?: number;
+  // per-turn overrides, sent on turn/start only when set. app-server applies them to "this turn
+  // and subsequent turns", so leaving one out keeps the thread's current setting -- they are
+  // never sent as null, which would not mean "unchanged".
+  model?: string;
+  effort?: string;
 }
 
 export interface TurnResult {
@@ -116,7 +121,19 @@ function extractUpstreamError(
   return code !== undefined ? { message, code } : { message };
 }
 
+export interface SupportedEfforts {
+  model: string;
+  efforts: string[];
+}
+
+interface ListedModel {
+  id: string;
+  model?: string;
+  supportedReasoningEfforts?: { reasoningEffort: string }[];
+}
+
 export class TurnRunner {
+  private modelsPromise: Promise<ListedModel[]> | undefined;
   // thread ids this instance itself created or resumed -- ensureThread() is a no-op for these
   private readonly knownThreadIds = new Set<string>();
   // one queued promise per threadId, so a second runTurn() on the same thread waits for the
@@ -146,6 +163,53 @@ export class TurnRunner {
     const threadId = result.thread.id;
     this.knownThreadIds.add(threadId);
     return { threadId };
+  }
+
+  // the reasoning efforts a model advertises, for validating an effort before it's sent. codex
+  // itself doesn't check: it stores whatever value it's given as the thread's effort, then every
+  // later turn fails at the model API until a valid one is sent (confirmed live, codex-cli
+  // 0.160.0, effort "turbo"). the model is the explicit one when given, otherwise the thread's
+  // current model. returns undefined when the model can't be determined or isn't listed, so a
+  // brand-new model codex doesn't advertise yet is never locked out -- this is a guard, not a gate.
+  async supportedEfforts(target: { model?: string; threadId?: string }): Promise<SupportedEfforts | undefined> {
+    try {
+      let model = target.model;
+      if (model === undefined && target.threadId !== undefined) {
+        const read = await this.client.request<{ thread?: { model?: string } }>(CLIENT_REQUESTS.threadRead, {
+          threadId: target.threadId,
+        });
+        model = read.thread?.model;
+      }
+      if (model === undefined) return undefined;
+      const models = await this.listModels();
+      const entry = models.find((m) => m.id === model || m.model === model);
+      if (!entry?.supportedReasoningEfforts) return undefined;
+      return { model, efforts: entry.supportedReasoningEfforts.map((e) => e.reasoningEffort) };
+    } catch {
+      return undefined;
+    }
+  }
+
+  // model/list, every page, fetched once per TurnRunner (i.e. per app-server child)
+  private listModels(): Promise<ListedModel[]> {
+    this.modelsPromise ??= (async () => {
+      const all: ListedModel[] = [];
+      let cursor: string | null | undefined;
+      do {
+        const page = await this.client.request<{ data: ListedModel[]; nextCursor?: string | null }>(
+          CLIENT_REQUESTS.modelList,
+          { includeHidden: true, ...(cursor ? { cursor } : {}) },
+        );
+        all.push(...page.data);
+        cursor = page.nextCursor;
+      } while (cursor);
+      return all;
+    })();
+    // a failed fetch shouldn't be cached forever
+    this.modelsPromise.catch(() => {
+      this.modelsPromise = undefined;
+    });
+    return this.modelsPromise;
   }
 
   // no-op when this instance already knows threadId is live (it started or resumed it itself);
@@ -287,7 +351,12 @@ export class TurnRunner {
       this.client
         .request<{ turn: { id: string } }>(
           CLIENT_REQUESTS.turnStart,
-          { threadId, input: [{ type: "text", text: prompt }] },
+          {
+            threadId,
+            input: [{ type: "text", text: prompt }],
+            ...(options.model !== undefined ? { model: options.model } : {}),
+            ...(options.effort !== undefined ? { effort: options.effort } : {}),
+          },
           // onSettled, NOT .then(): it runs synchronously the instant turn/start's response is
           // parsed, before any microtask. a stdout chunk (or run of chunks processed before the
           // microtask queue drains) can contain this response line immediately followed by this

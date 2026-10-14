@@ -115,6 +115,8 @@ describe("real MCP stdio surface (node dist/index.js over stdio)", () => {
     expect(codexSchema.properties.sandbox.enum).toEqual(["read-only", "workspace-write", "danger-full-access"]);
     expect(codexSchema.properties["timeout-seconds"].default).toBe(900);
     expect(codexSchema.properties.profile).toBeDefined();
+    expect(codexSchema.properties.effort).toBeDefined();
+    expect(codexSchema.properties.model).toBeDefined();
 
     const replySchema = byName.get("codex-reply")!.inputSchema as {
       properties: Record<string, { default?: unknown }>;
@@ -124,6 +126,8 @@ describe("real MCP stdio surface (node dist/index.js over stdio)", () => {
     expect(replySchema.properties.threadId).toBeDefined();
     expect(replySchema.properties.conversationId).toBeDefined();
     expect(replySchema.properties["timeout-seconds"].default).toBe(900);
+    expect(replySchema.properties.model).toBeDefined();
+    expect(replySchema.properties.effort).toBeDefined();
   });
 
   it("calls codex over the real transport and returns wire-level content + structuredContent", async () => {

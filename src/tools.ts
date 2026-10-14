@@ -6,7 +6,7 @@ import type { CallToolResult, ServerNotification, ServerRequest } from "@modelco
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
 
-import type { RunTurnOptions, StartThreadOptions, ThreadSettings, TurnResult } from "./turn-runner.js";
+import type { RunTurnOptions, StartThreadOptions, SupportedEfforts, ThreadSettings, TurnResult } from "./turn-runner.js";
 
 // the subset of TurnRunner's public surface these tools call -- a structural interface (rather
 // than importing the TurnRunner class type itself) so src/index.ts's lazy-spawn/respawn wrapper
@@ -15,6 +15,24 @@ export interface TurnRunnerLike {
   startThread(options: StartThreadOptions): Promise<{ threadId: string }>;
   ensureThread(threadId: string, fallback: ThreadSettings): Promise<void>;
   runTurn(threadId: string, prompt: string, options?: RunTurnOptions): Promise<TurnResult>;
+  supportedEfforts(target: { model?: string; threadId?: string }): Promise<SupportedEfforts | undefined>;
+}
+
+// rejects an effort the target model doesn't advertise, before any turn is sent -- codex would
+// store it on the thread and fail every later turn. undefined when the effort is fine, unset, or
+// can't be checked (unknown model, lookup failure): validation never blocks on its own failure.
+async function effortError(
+  turnRunner: TurnRunnerLike,
+  effort: string | undefined,
+  target: { model?: string; threadId?: string },
+): Promise<string | undefined> {
+  if (effort === undefined) return undefined;
+  const supported = await turnRunner.supportedEfforts(target);
+  if (!supported || supported.efforts.includes(effort)) return undefined;
+  return (
+    `effort "${effort}" is not supported by model ${supported.model}; supported values: ` +
+    `${supported.efforts.join(", ")}. Nothing was sent to Codex.`
+  );
 }
 
 type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
@@ -159,11 +177,11 @@ function runTurnWithProgress(
   turnRunner: TurnRunnerLike,
   threadId: string,
   prompt: string,
-  timeoutMs: number,
+  runOptions: RunTurnOptions,
   extra: ToolExtra,
 ): Promise<TurnResult> {
   const progressToken = extra._meta?.progressToken;
-  const run = turnRunner.runTurn(threadId, prompt, { timeoutMs });
+  const run = turnRunner.runTurn(threadId, prompt, runOptions);
 
   if (progressToken !== undefined) {
     let progress = 0;
@@ -182,9 +200,19 @@ function runTurnWithProgress(
 
 // --- `codex` -------------------------------------------------------------------------------
 
+// app-server applies per-turn model/effort to "this turn and subsequent turns" of the thread.
+const EFFORT_DESCRIPTION =
+  "Reasoning effort, as a value the model supports (for example low, medium, high, xhigh). " +
+  "Applies to this turn and every later turn in the thread. Omit to use the default from the " +
+  "Codex config (~/.codex/config.toml).";
+
 const codexInputShape = {
   prompt: z.string(),
-  model: z.string().optional(),
+  model: z
+    .string()
+    .optional()
+    .describe("Model for the new thread, for example gpt-6.1-sol. Omit to use the default from the Codex config."),
+  effort: z.string().min(1).optional().describe(EFFORT_DESCRIPTION),
   profile: z.string().optional(),
   cwd: z.string().optional(),
   "approval-policy": z.enum(["untrusted", "on-failure", "on-request", "never"]).default("never"),
@@ -232,11 +260,19 @@ export function createCodexTool(turnRunner: TurnRunnerLike): {
       });
       threadId = started.threadId;
 
+      // checked against the thread's actual model (thread/read), since without an explicit
+      // `model` the default comes from the codex config, which this server can't see. the thread
+      // already exists by then; its id is returned so the caller can reuse it.
+      const invalidEffort = await effortError(turnRunner, input.effort, { model: input.model, threadId });
+      if (invalidEffort !== undefined) return buildRejectedResult(new Error(invalidEffort), threadId, notes);
+
+      // model went on thread/start above; effort has no thread/start field, so it rides on the
+      // first turn/start, where app-server makes it sticky for the rest of the thread.
       const turnResult = await runTurnWithProgress(
         turnRunner,
         threadId,
         input.prompt,
-        input["timeout-seconds"] * 1000,
+        { timeoutMs: input["timeout-seconds"] * 1000, effort: input.effort },
         extra,
       );
       return buildToolResult(turnResult, notes);
@@ -264,6 +300,21 @@ const codexReplyInputSchema = z
     threadId: z.string().optional(),
     conversationId: z.string().optional(), // deprecated alias
     prompt: z.string(),
+    model: z
+      .string()
+      .optional()
+      .describe(
+        "Switch the thread to this model from this turn on (Codex keeps it for later turns too). " +
+          "Omit to keep the thread's current model.",
+      ),
+    effort: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Reasoning effort for this turn, as a value the model supports (for example low, medium, " +
+          "high, xhigh). Codex keeps it for later turns too. Omit to keep the thread's current effort.",
+      ),
     "timeout-seconds": z.number().int().positive().default(900),
   })
   .refine((value) => Boolean(value.threadId || value.conversationId), {
@@ -287,11 +338,13 @@ export function createCodexReplyTool(turnRunner: TurnRunnerLike): {
 
     try {
       await turnRunner.ensureThread(threadId, REPLY_FALLBACK_SETTINGS);
+      const invalidEffort = await effortError(turnRunner, input.effort, { model: input.model, threadId });
+      if (invalidEffort !== undefined) return buildRejectedResult(new Error(invalidEffort), threadId, []);
       const turnResult = await runTurnWithProgress(
         turnRunner,
         threadId,
         input.prompt,
-        input["timeout-seconds"] * 1000,
+        { timeoutMs: input["timeout-seconds"] * 1000, model: input.model, effort: input.effort },
         extra,
       );
       return buildToolResult(turnResult, []);

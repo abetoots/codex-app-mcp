@@ -48,7 +48,8 @@ existing skills/tooling that call `mcp__codex__codex` /
 | Param | Values | Default | Note |
 |---|---|---|---|
 | `prompt` | string | — | required |
-| `model` | string | — | optional |
+| `model` | string | Codex config | model for the new thread |
+| `effort` | string | Codex config | reasoning effort; see note below |
 | `cwd` | string | server cwd | optional |
 | `approval-policy` | `untrusted \| on-failure \| on-request \| never` | `never` | `on-failure` maps to `on-request` — app-server dropped that value |
 | `sandbox` | `read-only \| workspace-write \| danger-full-access` | `read-only` | |
@@ -66,7 +67,17 @@ existing skills/tooling that call `mcp__codex__codex` /
 | `threadId` | string | — | required, or use `conversationId` |
 | `conversationId` | string | — | deprecated alias for `threadId` |
 | `prompt` | string | — | required |
+| `model` | string | thread's current | switches the thread from this turn on |
+| `effort` | string | thread's current | switches the thread from this turn on |
 | `timeout-seconds` | number | `900` | |
+
+**Model and effort stick.** Codex applies a per-turn `model` or `effort` to that
+turn and every later turn in the thread, so `codex-reply` without either keeps
+whatever the thread last used. Valid `effort` values depend on the model (for
+`gpt-6.1-sol`: low, medium, high, xhigh, max, ultra). The server checks the
+requested effort against the model's advertised list and refuses it, without
+sending anything, if it isn't there. Codex itself would store an invalid value
+and fail every later turn on that thread.
 
 ### Result shape (both tools)
 
@@ -94,7 +105,7 @@ To check which version a running server is on, look at its stderr: it logs
 
 ## Testing
 
-- `npm test` runs the full suite (82 tests) against `tests/fake-app-server.mjs`,
+- `npm test` runs the full suite (91 tests) against `tests/fake-app-server.mjs`,
   a scripted stand-in for `codex app-server`. Fast, no network, no auth
   needed — this is what CI/every commit should run.
 - `bin/smoke.sh` (or `CODEX_LIVE=1 npm run smoke`) runs a real end-to-end

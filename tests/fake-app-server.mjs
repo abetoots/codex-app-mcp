@@ -411,6 +411,46 @@ const scenarios = {
   // like runHandshakeAndThreadStart, but echoes thread/start's params via test/echo before
   // replying -- lets a test assert what codex-app-mcp actually sent (e.g. the mapped
   // approvalPolicy) without a schema validator running inside this process.
+  // answers whatever arrives, in any order, so effort-validation tests can drive either tool:
+  // model/list advertises one model "m1" supporting only low/high; thread/read says every
+  // thread runs m1; turn/start is echoed (so a test can tell whether one was ever sent) and
+  // completes normally.
+  async "effort-validation"() {
+    const init = await expect("initialize");
+    replyResult(init, initializeResult);
+    await expect("initialized");
+    for (;;) {
+      const msg = await nextMessage();
+      if (msg.method === "thread/start") {
+        replyResult(msg, { thread: { id: "t1" } });
+      } else if (msg.method === "thread/resume") {
+        replyResult(msg, { thread: { id: msg.params.threadId } });
+      } else if (msg.method === "thread/read") {
+        replyResult(msg, { thread: { id: msg.params.threadId, model: "m1" } });
+      } else if (msg.method === "model/list") {
+        replyResult(msg, {
+          data: [
+            {
+              id: "m1",
+              model: "m1",
+              supportedReasoningEfforts: [
+                { reasoningEffort: "low", description: "" },
+                { reasoningEffort: "high", description: "" },
+              ],
+            },
+          ],
+          nextCursor: null,
+        });
+      } else if (msg.method === "turn/start") {
+        send({ method: "test/echo", params: { receivedTurnStart: msg.params } });
+        const threadId = msg.params.threadId;
+        replyResult(msg, { turn: { id: "u1" } });
+        send({ method: "turn/started", params: threadStartedItem(threadId, "u1") });
+        await finishTurn(threadId, "u1");
+      }
+    }
+  },
+
   async "echo-thread-start"() {
     const init = await expect("initialize");
     replyResult(init, initializeResult);

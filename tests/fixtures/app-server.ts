@@ -20,6 +20,14 @@ export const clientRequests = {
     method: CLIENT_REQUESTS.threadResume,
     params: { threadId: "t1", cwd: "/tmp/x", approvalPolicy: "never", sandbox: "read-only" },
   },
+  modelList: {
+    method: CLIENT_REQUESTS.modelList,
+    params: { includeHidden: true },
+  },
+  threadRead: {
+    method: CLIENT_REQUESTS.threadRead,
+    params: { threadId: "t1" },
+  },
   turnStart: {
     method: CLIENT_REQUESTS.turnStart,
     params: { threadId: "t1", input: [{ type: "text", text: "hi" }] },

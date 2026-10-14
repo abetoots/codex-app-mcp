@@ -66,6 +66,7 @@ const defaultCodexInput = {
   "base-instructions": undefined,
   "developer-instructions": undefined,
   "compact-prompt": undefined,
+  effort: undefined,
   "timeout-seconds": 900,
 };
 
@@ -154,6 +155,24 @@ describe("codex tool", () => {
     expect(receivedThreadStart.approvalPolicy).toBe("on-request");
     expect(result.isError).toBeFalsy();
     expect((result.content[0] as { text: string }).text).toMatch(/on-failure.*on-request/);
+  });
+
+  it("sends effort on the first turn/start, and leaves it out entirely when not given", async () => {
+    for (const [effort, expected] of [["high", "high"], [undefined, undefined]] as const) {
+      const runner = await makeRunner("effort-validation");
+      const tool = createCodexTool(runner);
+      const client = clients[clients.length - 1];
+      const echo = waitForNotification(client, "test/echo") as Promise<{ receivedTurnStart: Record<string, unknown> }>;
+
+      const result = await tool.handler({ ...defaultCodexInput, effort }, asExtra(fakeExtra()));
+      const { receivedTurnStart } = await echo;
+
+      expect(result.isError).toBeFalsy();
+      expect(receivedTurnStart.effort).toBe(expected);
+      expect("effort" in receivedTurnStart).toBe(expected !== undefined);
+      // `codex` sets model at thread level (thread/start), not per turn
+      expect("model" in receivedTurnStart).toBe(false);
+    }
   });
 
   it("folds compact-prompt into developer-instructions and notes it", async () => {
@@ -264,7 +283,14 @@ describe("codex tool", () => {
   });
 });
 
-const defaultReplyInput = { threadId: undefined, conversationId: undefined, prompt: "what did you say?", "timeout-seconds": 900 };
+const defaultReplyInput = {
+  threadId: undefined,
+  conversationId: undefined,
+  prompt: "what did you say?",
+  model: undefined,
+  effort: undefined,
+  "timeout-seconds": 900,
+};
 
 describe("codex-reply tool", () => {
   it("happy path with threadId continues correctly, structuredContent.threadId present", async () => {
@@ -288,6 +314,30 @@ describe("codex-reply tool", () => {
     expect((result.content[0] as { text: string }).text).toMatch(/no text|stale|empty/i);
     expect(result.structuredContent).toMatchObject({ threadId: "old-thread", status: "completed" });
     expect(typeof (result.structuredContent as { errorText?: unknown }).errorText).toBe("string");
+  });
+
+  it("passes model and effort on turn/start when given, and omits both keys when not", async () => {
+    const cases = [
+      { input: { model: "m1", effort: "low" }, sent: { model: "m1", effort: "low" } },
+      { input: {}, sent: {} },
+    ];
+    for (const { input, sent } of cases) {
+      const runner = await makeRunner("effort-validation");
+      const tool = createCodexReplyTool(runner);
+      const client = clients[clients.length - 1];
+      const echo = waitForNotification(client, "test/echo") as Promise<{ receivedTurnStart: Record<string, unknown> }>;
+
+      const result = await tool.handler({ ...defaultReplyInput, threadId: "old-thread", ...input }, asExtra(fakeExtra()));
+      const { receivedTurnStart } = await echo;
+
+      expect(result.isError).toBeFalsy();
+      expect({ model: receivedTurnStart.model, effort: receivedTurnStart.effort }).toEqual({
+        model: (sent as { model?: string }).model,
+        effort: (sent as { effort?: string }).effort,
+      });
+      expect("model" in receivedTurnStart).toBe("model" in sent);
+      expect("effort" in receivedTurnStart).toBe("effort" in sent);
+    }
   });
 
   it("honors the deprecated conversationId alias when threadId is absent", async () => {
@@ -342,5 +392,90 @@ describe("codex-reply tool", () => {
     expect(result.isError).toBe(true);
     expect(result.structuredContent).toEqual({ threadId: "old-thread", errorText: "turn start failed" });
     expect((result.content[0] as { text: string }).text).toMatch(/turn start failed/);
+  });
+});
+
+describe("effort validation", () => {
+  // codex stores whatever effort it's given without checking, then every later turn on that
+  // thread fails at the model API until a valid value is sent (confirmed live on 0.160.0 with
+  // "turbo"). so an effort the target model doesn't advertise is rejected before anything is sent.
+  function turnStartSent(scenarioClient: AppServerClient): { sent: boolean } {
+    const state = { sent: false };
+    scenarioClient.on("test/echo", () => {
+      state.sent = true;
+    });
+    return state;
+  }
+
+  it("codex: rejects an effort the thread's model doesn't support, without sending a turn", async () => {
+    const runner = await makeRunner("effort-validation");
+    const turn = turnStartSent(clients[clients.length - 1]);
+    const tool = createCodexTool(runner);
+
+    const result = await tool.handler({ ...defaultCodexInput, effort: "turbo" }, asExtra(fakeExtra()));
+
+    expect(result.isError).toBe(true);
+    const text = (result.content[0] as { text: string }).text;
+    expect(text).toContain("turbo");
+    expect(text).toContain("m1");
+    expect(text).toContain("low, high");
+    expect(turn.sent).toBe(false);
+    // the thread was already created; hand back its id so the caller can reuse it
+    expect(result.structuredContent).toMatchObject({ threadId: "t1" });
+  });
+
+  it("codex: lets a supported effort through", async () => {
+    const runner = await makeRunner("effort-validation");
+    const turn = turnStartSent(clients[clients.length - 1]);
+    const tool = createCodexTool(runner);
+
+    const result = await tool.handler({ ...defaultCodexInput, effort: "high" }, asExtra(fakeExtra()));
+
+    expect(result.isError).toBeFalsy();
+    expect(turn.sent).toBe(true);
+  });
+
+  it("codex-reply: checks effort against an explicit model override", async () => {
+    const runner = await makeRunner("effort-validation");
+    const turn = turnStartSent(clients[clients.length - 1]);
+    const tool = createCodexReplyTool(runner);
+
+    const result = await tool.handler(
+      { ...defaultReplyInput, threadId: "old", model: "m1", effort: "max" },
+      asExtra(fakeExtra()),
+    );
+
+    expect(result.isError).toBe(true);
+    expect((result.content[0] as { text: string }).text).toContain("max");
+    expect(turn.sent).toBe(false);
+    expect(result.structuredContent).toMatchObject({ threadId: "old" });
+  });
+
+  it("codex-reply: checks effort against the thread's current model when no model is given", async () => {
+    const runner = await makeRunner("effort-validation");
+    const turn = turnStartSent(clients[clients.length - 1]);
+    const tool = createCodexReplyTool(runner);
+
+    const rejected = await tool.handler({ ...defaultReplyInput, threadId: "old", effort: "turbo" }, asExtra(fakeExtra()));
+    expect(rejected.isError).toBe(true);
+    expect(turn.sent).toBe(false);
+
+    const accepted = await tool.handler({ ...defaultReplyInput, threadId: "old", effort: "low" }, asExtra(fakeExtra()));
+    expect(accepted.isError).toBeFalsy();
+    expect(turn.sent).toBe(true);
+  });
+
+  it("does not block a model codex doesn't list, so validation can't lock out new models", async () => {
+    const runner = await makeRunner("effort-validation");
+    const turn = turnStartSent(clients[clients.length - 1]);
+    const tool = createCodexReplyTool(runner);
+
+    const result = await tool.handler(
+      { ...defaultReplyInput, threadId: "old", model: "brand-new-model", effort: "turbo" },
+      asExtra(fakeExtra()),
+    );
+
+    expect(result.isError).toBeFalsy();
+    expect(turn.sent).toBe(true);
   });
 });

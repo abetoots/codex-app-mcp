@@ -71,6 +71,10 @@ export function createLazyTurnRunner(options: LazyTurnRunnerOptions): TurnRunner
       const runner = await getRunner();
       return runner.runTurn(threadId, prompt, runOptions);
     },
+    async supportedEfforts(target: { model?: string; threadId?: string }) {
+      const runner = await getRunner();
+      return runner.supportedEfforts(target);
+    },
   };
 }
 

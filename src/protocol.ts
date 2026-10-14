@@ -9,6 +9,10 @@ export const CLIENT_REQUESTS = {
   threadResume: "thread/resume",
   turnStart: "turn/start",
   turnInterrupt: "turn/interrupt",
+  // used only to validate a requested reasoning effort before it's sent (see
+  // TurnRunner.supportedEfforts): codex stores an invalid effort and then fails every later turn
+  modelList: "model/list",
+  threadRead: "thread/read",
 } as const;
 
 // notifications we send to the app-server
