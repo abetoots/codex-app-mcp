@@ -366,9 +366,22 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
         {
           timeoutMs: input["timeout-seconds"] * 1000,
           effort: input.effort,
-          // the same check again once the turn has its place in the queue
+          // once the turn has its place in the queue, a resume check on the binding just saved:
+          // its project, grant and revision, and the same fingerprint
           beforeStart: async () => {
-            await allowedDecision(deps, startRequest, binding.effectiveHash);
+            await allowedDecision(
+              deps,
+              {
+                phase: "resume",
+                harness: "codex",
+                cwd,
+                addDirs: [],
+                grantId: binding.grantId,
+                revision: binding.grantRevision,
+                boundProject: binding.project,
+              },
+              binding.effectiveHash,
+            );
           },
         },
         extra,

@@ -6,6 +6,8 @@
 //   fixture.byPhase[p]   -- else the answer for phase p
 //   fixture.decision     -- else this
 // exit 0 allowed, 2 denied, as the real checker does; fixture.exit overrides (e.g. 3).
+//   fixture.exitWith  -- print the decision but exit with this code (a contract violation)
+//   fixture.rawStdout -- print this text instead of a decision, exit 0
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,7 +25,11 @@ process.stdin.on("end", () => {
   appendFileSync(logPath, `${JSON.stringify(request)}\n`);
   const fixture = JSON.parse(readFileSync(join(dir, "fixture.json"), "utf8"));
   if (fixture.exit !== undefined) process.exit(fixture.exit);
+  if (fixture.rawStdout !== undefined) {
+    process.stdout.write(fixture.rawStdout);
+    process.exit(0);
+  }
   const decision = fixture.sequence?.[n] ?? fixture.byPhase?.[request.phase] ?? fixture.decision;
   process.stdout.write(`${JSON.stringify(decision)}\n`);
-  process.exit(decision.allowed ? 0 : 2);
+  process.exit(fixture.exitWith ?? (decision.allowed ? 0 : 2));
 });

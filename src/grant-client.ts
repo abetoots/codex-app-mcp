@@ -73,8 +73,9 @@ const CHECK_TIMEOUT_MS = 10_000;
 export class GrantClient {
   constructor(private readonly checkerPath: string) {}
 
-  // exit 0 (allowed) and 2 (denied) both carry a decision; anything else -- a missing checker,
-  // exit 3 (unreadable registry), a timeout, bad output -- rejects, so callers fail closed.
+  // exit 0 and 2 carry a decision; anything else -- a missing checker, exit 3 (unreadable
+  // registry), a timeout, bad output -- rejects, so callers fail closed. a decision is allowed
+  // only when the exit is 0 AND its json says so. no error here ever carries checker output.
   check(req: GrantRequest): Promise<GrantDecision> {
     return new Promise((resolve, reject) => {
       const child = spawn(this.checkerPath, [], { stdio: ["pipe", "pipe", "ignore"] });
@@ -97,11 +98,17 @@ export class GrantClient {
           reject(new Error(`grant checker exited ${code}`));
           return;
         }
+        let decision: GrantDecision;
         try {
-          resolve(fromWire(JSON.parse(out)));
-        } catch (err) {
-          reject(err instanceof Error ? err : new Error(String(err)));
+          decision = fromWire(JSON.parse(out));
+        } catch {
+          reject(new Error("grant checker returned unreadable output"));
+          return;
         }
+        if (code !== 0 && decision.allowed) {
+          decision = { ...decision, allowed: false, reason: "checker-exit-mismatch" };
+        }
+        resolve(decision);
       });
       child.stdin.on("error", () => {
         // the close handler reports the failure

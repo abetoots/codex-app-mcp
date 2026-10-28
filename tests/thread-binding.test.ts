@@ -227,6 +227,37 @@ describe("GrantClient", () => {
   });
 });
 
+describe("GrantClient contract", () => {
+  const req: GrantRequest = { phase: "start", harness: "codex", cwd: "/x", addDirs: [], grantId: null, revision: null, boundProject: null };
+
+  it("exit 2 with allowed:true is a denial, not an allow", async () => {
+    const env = makeEnv({ decision: wireDecision(), exitWith: 2 });
+    const decision = await env.grants.check(req).catch(() => undefined);
+    expect(decision?.allowed ?? false).toBe(false);
+  });
+
+  it("a checker that cannot run, or exits 1, rejects and never allows", async () => {
+    const env = makeEnv({ decision: wireDecision(), exitWith: 1 });
+    await expect(env.grants.check(req)).rejects.toThrow(/exited 1/);
+    await expect(new GrantClient(join(env.dir, "absent")).check(req)).rejects.toThrow(/could not run/);
+  });
+
+  it("malformed stdout is refused with a fixed message that never echoes the output", async () => {
+    const env = makeEnv({ rawStdout: "S3CR3T-not-json" });
+    const { codex } = await boot(env);
+    const errors = vi.spyOn(console, "error");
+
+    const result = await codex.handler({ ...codexInput, cwd: env.cwd }, extra);
+
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toMatch(/grant check failed/);
+    expect(JSON.stringify([result, errors.mock.calls])).not.toContain("S3CR3T");
+    expect(calls(env, "thread/start")).toHaveLength(0);
+    await expect(env.grants.check(req)).rejects.toThrow(/unreadable output/);
+    await env.grants.check(req).catch((e: Error) => expect(e.message).not.toContain("S3CR3T"));
+  });
+});
+
 describe("codex thread binding", () => {
   it("codex outside any project without a grant works and stores a binding", async () => {
     const env = makeEnv({ decision: wireDecision({ reason: "no-project", project: null, effective_hash: "h0" }) });
@@ -292,6 +323,61 @@ describe("codex thread binding", () => {
   });
 });
 
+describe("codex first-turn recheck", () => {
+  it("the start check carries the caller's grant", async () => {
+    const env = makeEnv({ decision: granted() });
+    const { codex } = await boot(env);
+    await codex.handler({ ...codexInput, cwd: env.cwd, grant: "g1" }, extra);
+
+    expect(lines(env.requestsLog)[0]).toEqual({
+      phase: "start", harness: "codex", cwd: env.cwd, add_dirs: [], grant_id: "g1", revision: null, bound_project: null,
+    });
+  });
+
+  it.each([
+    ["the project mapping changed", "project-changed"],
+    ["the grant was revoked", "revoked"],
+  ])("refuses the first turn when %s between start and first turn", async (_name, reason) => {
+    const env = makeEnv({ byPhase: { start: granted(), resume: denied(reason) } });
+    const { codex } = await boot(env);
+
+    const result = await codex.handler({ ...codexInput, cwd: env.cwd, grant: "g1" }, extra);
+
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain(reason);
+    expect(calls(env, "turn/start")).toHaveLength(0);
+    // the recheck is a resume check on the just-saved binding's project, grant and revision
+    expect(lines(env.requestsLog)[1]).toMatchObject({ phase: "resume", grant_id: "g1", revision: 1, bound_project: "p1", cwd: env.cwd });
+  });
+
+  it("refuses the first turn when the standing scope fingerprint changed", async () => {
+    const env = makeEnv({ sequence: [wireDecision(), wireDecision({ effective_hash: "h2" })] });
+    const { codex } = await boot(env);
+
+    const result = await codex.handler({ ...codexInput, cwd: env.cwd }, extra);
+
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toMatch(/standing scope changed/);
+    expect(calls(env, "turn/start")).toHaveLength(0);
+  });
+
+  it("a checker that cannot run refuses codex and codex-reply", async () => {
+    const env = makeEnv();
+    await (await boot(env)).codex.handler({ ...codexInput, cwd: env.cwd }, extra);
+    setFixture(env, { exit: 3 });
+    const restarted = await boot(env);
+
+    const replied = await restarted.reply.handler({ ...replyInput, threadId: "t1" }, extra);
+    const started = await restarted.codex.handler({ ...codexInput, cwd: env.cwd }, extra);
+
+    expect(replied.isError).toBe(true);
+    expect(textOf(replied)).toMatch(/grant check failed/);
+    expect(calls(env, "thread/resume")).toHaveLength(0);
+    expect(started.isError).toBe(true);
+    expect(calls(env, "thread/start")).toHaveLength(1);
+  });
+});
+
 describe("codex-reply thread binding", () => {
   it("reply with no binding after restart is refused", async () => {
     const env = makeEnv();
@@ -338,8 +424,9 @@ describe("codex-reply thread binding", () => {
     ["reply after the grant revision changed is refused", "revision-changed"],
     ["reply after the project mapping changed is refused", "project-changed"],
   ])("%s", async (_name, reason) => {
-    const env = makeEnv({ byPhase: { start: granted(), resume: denied(reason) } });
+    const env = makeEnv({ decision: granted() });
     await (await boot(env)).codex.handler({ ...codexInput, cwd: env.cwd, grant: "g1" }, extra);
+    setFixture(env, { byPhase: { start: granted(), resume: denied(reason) } });
     const { reply } = await boot(env);
 
     const result = await reply.handler({ ...replyInput, threadId: "t1" }, extra);
@@ -348,8 +435,9 @@ describe("codex-reply thread binding", () => {
     expect(textOf(result)).toContain(reason);
     expect(calls(env, "thread/resume")).toHaveLength(0);
     expect(calls(env, "turn/start")).toHaveLength(1);
-    // the resume check carries the bound project, grant and revision
-    expect(lines(env.requestsLog).filter((r) => r.phase === "resume")[0]).toMatchObject({
+    // the resume check carries the bound project, grant and revision (the first resume line is
+    // codex's own first-turn recheck)
+    expect(lines(env.requestsLog).filter((r) => r.phase === "resume")[1]).toMatchObject({
       grant_id: "g1",
       revision: 1,
       bound_project: "p1",
