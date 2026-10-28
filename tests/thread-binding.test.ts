@@ -381,6 +381,21 @@ describe("codex thread binding", () => {
       if (statSync(path).isFile()) expect(readFileSync(path, "utf8")).not.toContain("S3CR3T");
     }
   });
+
+  it("codex is refused when the start check denies", async () => {
+    // resume is allowed on purpose: the first-turn recheck must not be what stops the call
+    const env = makeEnv({ byPhase: { start: denied("outside-roots"), resume: wireDecision() } });
+    const { codex } = await boot(env);
+
+    const result = await codex.handler({ ...codexInput, cwd: env.cwd }, extra);
+
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("outside-roots");
+    expect(calls(env, "thread/start")).toHaveLength(0);
+    expect(calls(env, "turn/start")).toHaveLength(0);
+    expect(existsSync(env.stateDir) ? readdirSync(env.stateDir) : []).toEqual([]);
+    expect(lines(env.requestsLog)).toHaveLength(1);
+  });
 });
 
 describe("codex first-turn recheck", () => {
