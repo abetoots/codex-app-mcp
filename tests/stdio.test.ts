@@ -5,7 +5,9 @@
 // default-filling (which only happens via McpServer.registerTool's schema conversion) or the
 // wire-level JSON-RPC framing itself.
 import { spawn } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -27,11 +29,31 @@ const fakeServerPath = fileURLToPath(new URL("./fake-app-server.mjs", import.met
 // race every other test file vitest runs in parallel, starving them of cpu and risking spurious
 // timeouts (see the 2026-09-14 finding B fix commit for the flakiness this used to cause).
 
+// the built server reads bindings from CODEX_MCP_STATE_DIR and asks AI_GRANT_CHECK before every
+// thread; point both at a temp dir and a checker that allows everything, never the real ones.
+const bindingDir = mkdtempSync(join(tmpdir(), "stdio-test-"));
+const fakeChecker = join(bindingDir, "grant-check.mjs");
+copyFileSync(fileURLToPath(new URL("./fake-grant-check.mjs", import.meta.url)), fakeChecker);
+chmodSync(fakeChecker, 0o755);
+writeFileSync(
+  join(bindingDir, "fixture.json"),
+  JSON.stringify({
+    decision: { allowed: true, reason: "no-project", project: null, grant_revision: null, expires_at: null, roots: [], effective_hash: "h0" },
+  }),
+);
+
 describe("real MCP stdio surface (node dist/index.js over stdio)", () => {
   let client: Client | undefined;
 
   function stdioEnv(scenario: string, extra: Record<string, string> = {}): NodeJS.ProcessEnv {
-    return { ...process.env, CODEX_BIN: fakeServerPath, FAKE_SCENARIO: scenario, ...extra };
+    return {
+      ...process.env,
+      CODEX_BIN: fakeServerPath,
+      FAKE_SCENARIO: scenario,
+      AI_GRANT_CHECK: fakeChecker,
+      CODEX_MCP_STATE_DIR: join(bindingDir, "bindings"),
+      ...extra,
+    };
   }
 
   async function connect(scenario: string, extra: Record<string, string> = {}): Promise<Client> {

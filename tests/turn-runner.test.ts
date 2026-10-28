@@ -1,3 +1,6 @@
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -361,5 +364,65 @@ describe("ensureThread", () => {
     const elapsed = Date.now() - start;
 
     expect(elapsed).toBeLessThan(250);
+  });
+});
+
+describe("thread/resume settings and beforeStart", () => {
+  function logged(logFile: string): Array<{ method: string; params: Record<string, unknown> }> {
+    if (!existsSync(logFile)) return [];
+    return readFileSync(logFile, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  }
+  const newLog = (): string => join(mkdtempSync(join(tmpdir(), "turn-runner-test-")), "app-server.log");
+
+  it("ensureThread sends cwd, approvalPolicy, sandbox and model on thread/resume", async () => {
+    const logFile = newLog();
+    const runner = await makeRunner("binding-log", { FAKE_LOG: logFile });
+
+    await runner.ensureThread("old", { cwd: "/tmp/x", approvalPolicy: "on-request", sandbox: "workspace-write", model: "mA" });
+
+    expect(logged(logFile).find((l) => l.method === "thread/resume")?.params).toEqual({
+      threadId: "old",
+      cwd: "/tmp/x",
+      approvalPolicy: "on-request",
+      sandbox: "workspace-write",
+      model: "mA",
+    });
+  });
+
+  it("beforeStart runs after the previous turn on the thread settles and before turn/start", async () => {
+    const logFile = newLog();
+    const runner = await makeRunner("binding-log", { FAKE_LOG: logFile });
+    const { threadId } = await runner.startThread(readOnlySettings);
+    const seen: number[] = [];
+
+    const first = runner.runTurn(threadId, "slow first");
+    const second = runner.runTurn(threadId, "second", {
+      beforeStart: async () => {
+        // the slow first turn has fully completed, and no second turn/start was sent yet
+        seen.push(logged(logFile).filter((l) => l.method === "turn/start").length);
+      },
+    });
+
+    expect((await first).status).toBe("completed");
+    expect((await second).text).toBe("second");
+    expect(seen).toEqual([1]);
+  });
+
+  it("a throw from beforeStart ends the call without sending turn/start", async () => {
+    const logFile = newLog();
+    const runner = await makeRunner("binding-log", { FAKE_LOG: logFile });
+    const { threadId } = await runner.startThread(readOnlySettings);
+
+    await expect(
+      runner.runTurn(threadId, "never sent", {
+        beforeStart: async () => {
+          throw new Error("revoked");
+        },
+      }),
+    ).rejects.toThrow("revoked");
+
+    expect(logged(logFile).filter((l) => l.method === "turn/start")).toHaveLength(0);
+    // and the thread's queue is not stuck behind the failed call
+    expect((await runner.runTurn(threadId, "next")).text).toBe("next");
   });
 });

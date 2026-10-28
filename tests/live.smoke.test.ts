@@ -2,9 +2,13 @@
 // server here. skipped unless CODEX_LIVE=1 is set, so `npm test` stays fast and offline. run
 // with `CODEX_LIVE=1 npx vitest run tests/live.smoke.test.ts` (or `bin/smoke.sh`) after every
 // `codex update` to catch app-server protocol drift.
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { AppServerClient } from "../src/app-server-client.js";
+import { BindingStore } from "../src/thread-binding.js";
 import { TurnRunner } from "../src/turn-runner.js";
 import { createCodexTool } from "../src/tools.js";
 
@@ -77,7 +81,23 @@ describe.skipIf(!process.env.CODEX_LIVE)("live smoke: real codex app-server", ()
       const client = spawnClient();
       await client.initialize();
       const runner = new TurnRunner(client);
-      const tool = createCodexTool(runner);
+      // a temp store and an allow-all checker: this smoke test is about the app-server protocol,
+      // not the grant checker
+      const grants = {
+        check: async () => ({
+          allowed: true,
+          reason: "no-project",
+          project: null,
+          grantRevision: null,
+          expiresAt: null,
+          roots: [],
+          effectiveHash: "h0",
+        }),
+      };
+      const tool = createCodexTool(runner, {
+        bindings: new BindingStore(join(mkdtempSync(join(tmpdir(), "live-smoke-")), "bindings")),
+        grants,
+      });
 
       // tool.handler is called directly (not through the MCP server), so zod defaults are
       // not applied automatically -- supply the fully-populated shape ourselves, matching

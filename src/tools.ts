@@ -1,11 +1,15 @@
 // zod schemas + handlers for the `codex` / `codex-reply` tools, re-exposing the removed `codex
 // mcp-server`'s 0.151.0 field set over a TurnRunner so the multi-model/gauntlet skills need zero
 // changes. knows nothing about stdio/child-process wiring -- src/index.ts owns that.
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import { z } from "zod";
 import type { CallToolResult, ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
 
+import type { GrantClient, GrantDecision, GrantRequest } from "./grant-client.js";
+import type { BindingStore, ThreadBinding } from "./thread-binding.js";
 import type { RunTurnOptions, StartThreadOptions, SupportedEfforts, ThreadSettings, TurnResult } from "./turn-runner.js";
 
 // the subset of TurnRunner's public surface these tools call -- a structural interface (rather
@@ -13,7 +17,7 @@ import type { RunTurnOptions, StartThreadOptions, SupportedEfforts, ThreadSettin
 // (which is not, and cannot cheaply be, an actual TurnRunner instance) can be passed in too.
 export interface TurnRunnerLike {
   startThread(options: StartThreadOptions): Promise<{ threadId: string }>;
-  ensureThread(threadId: string, fallback: ThreadSettings): Promise<void>;
+  ensureThread(threadId: string, settings: ThreadSettings): Promise<void>;
   runTurn(threadId: string, prompt: string, options?: RunTurnOptions): Promise<TurnResult>;
   supportedEfforts(target: { model?: string; threadId?: string }): Promise<SupportedEfforts | undefined>;
 }
@@ -35,6 +39,48 @@ async function effortError(
   );
 }
 
+// what the tools need to bind a thread to its project and grant: where bindings live, and the
+// grant checker (only `check` is used, so a test can hand in a stub).
+export interface BindingDeps {
+  bindings: BindingStore;
+  grants: Pick<GrantClient, "check">;
+}
+
+const CONFIG_UNSUPPORTED_TEXT =
+  "the `config` field is not supported: a thread gets its MCP servers only from the project's " +
+  "files, never from the caller. Drop `config` from the request. Nothing was sent to Codex.";
+
+const NO_BINDING_TEXT =
+  "this thread has no readable binding (it was started before bindings existed, by another " +
+  "state directory, or its record is damaged), so it cannot be resumed. Start a new `codex` thread.";
+
+const SCOPE_CHANGED_TEXT =
+  "the project's standing scope changed since this thread started; start a new `codex` thread.";
+
+// the real path when the directory exists, else just the resolved one (thread/start then fails
+// on it as before)
+function realPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+// the checker's decision, or an error: a denied decision, an unreachable checker, and (when the
+// thread is already bound) a changed standing scope all stop the call.
+async function allowedDecision(deps: BindingDeps, req: GrantRequest, boundHash?: string): Promise<GrantDecision> {
+  let decision: GrantDecision;
+  try {
+    decision = await deps.grants.check(req);
+  } catch (err) {
+    throw new Error(`grant check failed: ${errorMessage(err)}. Nothing was sent to Codex.`);
+  }
+  if (!decision.allowed) throw new Error(`refused by the grant check (${decision.reason}). Nothing was sent to Codex.`);
+  if (boundHash !== undefined && decision.effectiveHash !== boundHash) throw new Error(SCOPE_CHANGED_TEXT);
+  return decision;
+}
+
 type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
 
 // how often to send a keepalive notifications/progress while a turn is in flight, when the
@@ -44,7 +90,7 @@ const PROGRESS_INTERVAL_MS = 10_000;
 const PROFILE_UNSUPPORTED_TEXT =
   "the `profile` field has no equivalent in codex app-server's ThreadStartParams (the thread/start " +
   "request codex-app-mcp sends), so it is not supported here. Drop `profile` from the request " +
-  "and use `model` / `config` instead.";
+  "and use `model` instead.";
 
 // `on-failure` was removed from codex app-server's ApprovalPolicy; codex-app-mcp treats it as
 // `on-request` and says so in the result text rather than failing the call outright.
@@ -215,6 +261,7 @@ const codexInputShape = {
   effort: z.string().min(1).optional().describe(EFFORT_DESCRIPTION),
   profile: z.string().optional(),
   cwd: z.string().optional(),
+  grant: z.string().optional().describe("Id of a session grant that binds this thread to a project, from `bin/grant issue`."),
   "approval-policy": z.enum(["untrusted", "on-failure", "on-request", "never"]).default("never"),
   sandbox: z.enum(["read-only", "workspace-write", "danger-full-access"]).default("read-only"),
   config: z.record(z.string(), z.unknown()).optional(),
@@ -224,7 +271,7 @@ const codexInputShape = {
   "timeout-seconds": z.number().int().positive().default(900),
 };
 
-export function createCodexTool(turnRunner: TurnRunnerLike): {
+export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): {
   name: string;
   description: string;
   inputSchema: typeof codexInputShape;
@@ -233,6 +280,28 @@ export function createCodexTool(turnRunner: TurnRunnerLike): {
   const handler: ToolCallback<typeof codexInputShape> = async (input, extra) => {
     if (input.profile !== undefined) {
       return { isError: true, content: [{ type: "text", text: PROFILE_UNSUPPORTED_TEXT }] };
+    }
+
+    if (input.config !== undefined) {
+      return { isError: true, content: [{ type: "text", text: CONFIG_UNSUPPORTED_TEXT }] };
+    }
+
+    // a thread without a cwd would run wherever app-server happens to be; bind it to ours
+    const cwd = realPath(input.cwd ?? process.cwd());
+    const startRequest: GrantRequest = {
+      phase: "start",
+      harness: "codex",
+      cwd,
+      addDirs: [],
+      grantId: input.grant ?? null,
+      revision: null,
+      boundProject: null,
+    };
+    let decision: GrantDecision;
+    try {
+      decision = await allowedDecision(deps, startRequest);
+    } catch (err) {
+      return buildRejectedResult(err, undefined, []);
     }
 
     const notes: string[] = [];
@@ -250,15 +319,37 @@ export function createCodexTool(turnRunner: TurnRunnerLike): {
     let threadId: string | undefined;
     try {
       const started = await turnRunner.startThread({
-        cwd: input.cwd,
+        cwd,
         model: input.model,
         approvalPolicy,
         sandbox: input.sandbox,
         baseInstructions: input["base-instructions"],
         developerInstructions,
-        config: input.config,
       });
-      threadId = started.threadId;
+      const startedId = started.threadId;
+
+      // saved before the first turn: a thread that cannot be bound is never used, and its id is
+      // not handed back either
+      const binding: ThreadBinding = {
+        schema: 1,
+        threadId: startedId,
+        cwd,
+        project: decision.project,
+        grantId: input.grant ?? null,
+        grantRevision: decision.grantRevision,
+        expiresAt: decision.expiresAt,
+        effectiveHash: decision.effectiveHash,
+        approvalPolicy,
+        sandbox: input.sandbox,
+        ...(input.model !== undefined ? { model: input.model } : {}),
+        createdAt: new Date().toISOString(),
+      };
+      try {
+        await deps.bindings.save(binding);
+      } catch (err) {
+        return buildRejectedResult(new Error(`could not save the thread binding: ${errorMessage(err)}`), undefined, notes);
+      }
+      threadId = startedId;
 
       // checked against the thread's actual model (thread/read), since without an explicit
       // `model` the default comes from the codex config, which this server can't see. the thread
@@ -272,7 +363,14 @@ export function createCodexTool(turnRunner: TurnRunnerLike): {
         turnRunner,
         threadId,
         input.prompt,
-        { timeoutMs: input["timeout-seconds"] * 1000, effort: input.effort },
+        {
+          timeoutMs: input["timeout-seconds"] * 1000,
+          effort: input.effort,
+          // the same check again once the turn has its place in the queue
+          beforeStart: async () => {
+            await allowedDecision(deps, startRequest, binding.effectiveHash);
+          },
+        },
         extra,
       );
       return buildToolResult(turnResult, notes);
@@ -300,6 +398,10 @@ const codexReplyInputSchema = z
     threadId: z.string().optional(),
     conversationId: z.string().optional(), // deprecated alias
     prompt: z.string(),
+    cwd: z
+      .string()
+      .optional()
+      .describe("Optional. Must be the directory the thread was started in; a different one is refused."),
     model: z
       .string()
       .optional()
@@ -321,12 +423,7 @@ const codexReplyInputSchema = z
     message: "threadId (or the deprecated conversationId) is required",
   });
 
-// codex-reply has no cwd/approval-policy/sandbox of its own -- these are the fallback settings
-// handed to TurnRunner.ensureThread() when a threadId came from a previous process/session and
-// this instance has no remembered settings for it.
-const REPLY_FALLBACK_SETTINGS: ThreadSettings = { approvalPolicy: "never", sandbox: "read-only" };
-
-export function createCodexReplyTool(turnRunner: TurnRunnerLike): {
+export function createCodexReplyTool(turnRunner: TurnRunnerLike, deps: BindingDeps): {
   name: string;
   description: string;
   inputSchema: typeof codexReplyInputSchema;
@@ -337,14 +434,55 @@ export function createCodexReplyTool(turnRunner: TurnRunnerLike): {
     const threadId = (input.threadId ?? input.conversationId) as string;
 
     try {
-      await turnRunner.ensureThread(threadId, REPLY_FALLBACK_SETTINGS);
+      // the thread's project, grant and settings come from its binding, never from the caller
+      let binding: ThreadBinding | undefined;
+      try {
+        binding = await deps.bindings.load(threadId);
+      } catch {
+        binding = undefined;
+      }
+      if (!binding) throw new Error(NO_BINDING_TEXT);
+      const bound = binding;
+      if (input.cwd !== undefined && realPath(input.cwd) !== bound.cwd) {
+        throw new Error("cwd differs from the directory this thread was started in. Nothing was sent to Codex.");
+      }
+      const resumeRequest: GrantRequest = {
+        phase: "resume",
+        harness: "codex",
+        cwd: bound.cwd,
+        addDirs: [],
+        grantId: bound.grantId,
+        revision: bound.grantRevision,
+        boundProject: bound.project,
+      };
+      await allowedDecision(deps, resumeRequest, bound.effectiveHash);
+
+      await turnRunner.ensureThread(threadId, {
+        cwd: bound.cwd,
+        approvalPolicy: bound.approvalPolicy,
+        sandbox: bound.sandbox,
+        model: bound.model,
+      });
       const invalidEffort = await effortError(turnRunner, input.effort, { model: input.model, threadId });
       if (invalidEffort !== undefined) return buildRejectedResult(new Error(invalidEffort), threadId, []);
       const turnResult = await runTurnWithProgress(
         turnRunner,
         threadId,
         input.prompt,
-        { timeoutMs: input["timeout-seconds"] * 1000, model: input.model, effort: input.effort },
+        {
+          timeoutMs: input["timeout-seconds"] * 1000,
+          model: input.model,
+          effort: input.effort,
+          // under the thread's lock: the check again after any queue wait, then the model switch
+          // is recorded, so a restart resumes on the model the thread last used
+          beforeStart: async () => {
+            await allowedDecision(deps, resumeRequest, bound.effectiveHash);
+            if (input.model === undefined) return;
+            const fresh = await deps.bindings.load(threadId);
+            if (!fresh) throw new Error(NO_BINDING_TEXT);
+            if (fresh.model !== input.model) await deps.bindings.save({ ...fresh, model: input.model });
+          },
+        },
         extra,
       );
       return buildToolResult(turnResult, []);
@@ -363,7 +501,7 @@ export function createCodexReplyTool(turnRunner: TurnRunnerLike): {
   return {
     name: "codex-reply",
     description:
-      "Continues an existing Codex thread started by `codex` (or a previous session) with a follow-up " +
+      "Continues an existing Codex thread started by `codex` (or a previous session of this server) with a follow-up " +
       "prompt. Mirrors the removed `codex mcp-server`'s `codex-reply` tool; `conversationId` is accepted " +
       "as a deprecated alias for `threadId`.",
     inputSchema: codexReplyInputSchema,
