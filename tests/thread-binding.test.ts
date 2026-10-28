@@ -115,7 +115,8 @@ async function boot(env: Env) {
   clients.push(client);
   await client.initialize();
   const runner = new TurnRunner(client);
-  const deps = { bindings: env.store, grants: env.grants };
+  // a fresh store each boot, so nothing but the files on disk survives a restart
+  const deps = { bindings: new BindingStore(env.stateDir), grants: env.grants };
   return { codex: createCodexTool(runner, deps), reply: createCodexReplyTool(runner, deps) };
 }
 
@@ -183,6 +184,52 @@ describe("BindingStore", () => {
     await expect(env.store.load("t1")).rejects.toBeInstanceOf(BindingUnreadable);
     writeFileSync(file, JSON.stringify({ ...binding("t1"), schema: 2 }));
     await expect(env.store.load("t1")).rejects.toBeInstanceOf(BindingUnreadable);
+  });
+});
+
+describe("BindingStore field validation", () => {
+  const good = {
+    schema: 1, threadId: "t1", cwd: "/x", project: "p1", grantId: "g1", grantRevision: 1, expiresAt: null,
+    effectiveHash: "h1", approvalPolicy: "never", sandbox: "read-only", model: "mA", createdAt: "2026-10-28T00:00:00Z",
+  };
+
+  it.each<[string, Record<string, unknown>]>([
+    ["approvalPolicy typo", { approvalPolicy: "never-typo" }],
+    ["approvalPolicy on-failure (never stored)", { approvalPolicy: "on-failure" }],
+    ["sandbox typo", { sandbox: "read-onyl" }],
+    ["cwd number", { cwd: 42 }],
+    ["relative cwd", { cwd: "proj" }],
+    ["project number", { project: 7 }],
+    ["grantId number", { grantId: 7 }],
+    ["grantRevision string", { grantRevision: "1" }],
+    ["grantRevision fractional", { grantRevision: 1.5 }],
+    ["expiresAt number", { expiresAt: 5 }],
+    ["effectiveHash null", { effectiveHash: null }],
+    ["model number", { model: 3 }],
+    ["createdAt number", { createdAt: 1 }],
+    ["another thread's id", { threadId: "t2" }],
+  ])("a valid-json binding with %s is unreadable", async (_name, over) => {
+    const env = makeEnv();
+    await env.store.save(good as unknown as ThreadBinding);
+    const file = join(env.stateDir, `${createHash("sha256").update("t1").digest("hex")}.json`);
+    writeFileSync(file, JSON.stringify({ ...good, ...over }));
+    await expect(env.store.load("t1")).rejects.toBeInstanceOf(BindingUnreadable);
+  });
+
+  it("a malformed binding refuses the reply before thread/resume", async () => {
+    const env = makeEnv();
+    await (await boot(env)).codex.handler({ ...codexInput, cwd: env.cwd }, extra);
+    const [file] = readdirSync(env.stateDir);
+    const path = join(env.stateDir, file);
+    writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), approvalPolicy: "never-typo", sandbox: "read-onyl" }));
+    const { reply } = await boot(env);
+
+    const result = await reply.handler({ ...replyInput, threadId: "t1" }, extra);
+
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toMatch(/no readable binding/);
+    expect(calls(env, "thread/resume")).toHaveLength(0);
+    expect(calls(env, "turn/start")).toHaveLength(1);
   });
 });
 
@@ -282,6 +329,18 @@ describe("codex thread binding", () => {
     expect(lines(env.requestsLog)[0]).toMatchObject({ phase: "start", harness: "codex", cwd: env.cwd, grant_id: null });
   });
 
+  it("without a cwd the thread is bound to the launch directory's real path", async () => {
+    const env = makeEnv();
+    const { codex } = await boot(env);
+
+    await codex.handler({ ...codexInput, cwd: undefined }, extra);
+
+    const launchDir = realpathSync(process.cwd());
+    expect(calls(env, "thread/start")[0].params.cwd).toBe(launchDir);
+    expect((await env.store.load("t1"))?.cwd).toBe(launchDir);
+    expect(lines(env.requestsLog)[0].cwd).toBe(launchDir);
+  });
+
   it("two threads never overwrite each other's binding", async () => {
     const env = makeEnv();
     const { codex } = await boot(env);
@@ -308,14 +367,15 @@ describe("codex thread binding", () => {
     const env = makeEnv();
     const { codex } = await boot(env);
     const stderr = vi.spyOn(process.stderr, "write");
-    const log = vi.spyOn(console, "log");
+    const spies = (["log", "error", "warn", "info", "debug"] as const).map((m) => vi.spyOn(console, m));
 
     const result = await codex.handler({ ...codexInput, cwd: env.cwd, config: { token: "S3CR3T" } }, extra);
 
     expect(result.isError).toBe(true);
     expect(calls(env, "thread/start")).toHaveLength(0);
     expect(JSON.stringify(result)).not.toContain("S3CR3T");
-    expect(JSON.stringify([...stderr.mock.calls, ...log.mock.calls])).not.toContain("S3CR3T");
+    expect(textOf(result)).toMatch(/config/);
+    expect(JSON.stringify([...stderr.mock.calls, ...spies.flatMap((s) => s.mock.calls)])).not.toContain("S3CR3T");
     for (const name of readdirSync(env.dir, { recursive: true, encoding: "utf8" })) {
       const path = join(env.dir, name);
       if (statSync(path).isFile()) expect(readFileSync(path, "utf8")).not.toContain("S3CR3T");
@@ -469,23 +529,33 @@ describe("codex-reply thread binding", () => {
     expect(calls(env, "turn/start")).toHaveLength(1);
   });
 
-  it("revalidates after queue wait", async () => {
+  it.each([
+    ["without a restart", false],
+    ["after a restart", true],
+  ])("revalidates after queue wait, not before it (%s)", async (_name, restart) => {
     const env = makeEnv({ byPhase: { start: granted(), resume: granted() } });
-    const { codex, reply } = await boot(env);
-    await codex.handler({ ...codexInput, cwd: env.cwd, grant: "g1" }, extra);
+    const first0 = await boot(env);
+    await first0.codex.handler({ ...codexInput, cwd: env.cwd, grant: "g1" }, extra);
+    const { reply } = restart ? await boot(env) : first0;
 
-    const first = reply.handler({ ...replyInput, threadId: "t1", prompt: "slow one" }, extra);
+    const first = reply.handler({ ...replyInput, threadId: "t1", prompt: "hold one" }, extra);
     await waitFor(() => calls(env, "turn/start").length === 2, "first reply turn");
     const second = reply.handler({ ...replyInput, threadId: "t1", prompt: "second" }, extra);
     // start (2 checks) + first reply (2) + second reply's handler check
     await waitFor(() => lines(env.requestsLog).length === 5, "second reply's handler check");
+    // nothing is checked while the second reply sits in the queue
+    await new Promise((r) => setTimeout(r, 300));
+    expect(lines(env.requestsLog)).toHaveLength(5);
     setFixture(env, { byPhase: { start: granted(), resume: denied("revoked") } });
+    writeFileSync(`${env.logFile}.release`, "");
 
     expect((await first).isError).toBeFalsy();
     const refused = await second;
     expect(refused.isError).toBe(true);
     expect(textOf(refused)).toContain("revoked");
+    expect(lines(env.requestsLog)).toHaveLength(6);
     expect(calls(env, "turn/start")).toHaveLength(2);
+    if (restart) expect(calls(env, "thread/resume")).toHaveLength(1);
   });
 
   it("a model changed by a reply survives a restart", async () => {
@@ -493,6 +563,8 @@ describe("codex-reply thread binding", () => {
     await (await boot(env)).codex.handler({ ...codexInput, cwd: env.cwd, model: "mA" }, extra);
     const second = await boot(env);
     expect((await second.reply.handler({ ...replyInput, threadId: "t1", model: "mB" }, extra)).isError).toBeFalsy();
+    const file = join(env.stateDir, `${createHash("sha256").update("t1").digest("hex")}.json`);
+    expect(JSON.parse(readFileSync(file, "utf8")).model).toBe("mB");
 
     const { reply } = await boot(env);
     const result = await reply.handler({ ...replyInput, threadId: "t1" }, extra);
@@ -516,39 +588,41 @@ describe("codex-reply thread binding", () => {
     expect(resumes[resumes.length - 1].params.model).toBe("mA");
   });
 
-  it("reply after a real process restart resumes with the stored cwd, approval, sandbox and model", async () => {
+  it("reply after the server is SIGKILLed mid-turn resumes from disk with the stored cwd, approval, sandbox and model", async () => {
     const env = makeEnv();
-    const connect = async (): Promise<Client> => {
-      const c = new Client({ name: "binding-test", version: "0.0.0" });
-      await c.connect(
-        new StdioClientTransport({
-          command: process.execPath,
-          args: [distEntry],
-          env: {
-            ...process.env,
-            CODEX_BIN: fakeServerPath,
-            FAKE_SCENARIO: "binding-log",
-            FAKE_LOG: env.logFile,
-            AI_GRANT_CHECK: env.checker,
-            CODEX_MCP_STATE_DIR: env.stateDir,
-          },
-          stderr: "pipe",
-        }),
-      );
-      mcpClients.push(c);
-      return c;
+    const connect = async (): Promise<{ client: Client; transport: StdioClientTransport }> => {
+      const client = new Client({ name: "binding-test", version: "0.0.0" });
+      const transport = new StdioClientTransport({
+        command: process.execPath,
+        args: [distEntry],
+        env: {
+          ...process.env,
+          CODEX_BIN: fakeServerPath,
+          FAKE_SCENARIO: "binding-log",
+          FAKE_LOG: env.logFile,
+          AI_GRANT_CHECK: env.checker,
+          CODEX_MCP_STATE_DIR: env.stateDir,
+        },
+        stderr: "pipe",
+      });
+      await client.connect(transport);
+      mcpClients.push(client);
+      return { client, transport };
     };
 
     const first = await connect();
-    const started = await first.callTool({
-      name: "codex",
-      arguments: { prompt: "hi", model: "mA", "approval-policy": "on-request", sandbox: "workspace-write", cwd: env.cwd },
-    });
-    expect(started.isError).toBeFalsy();
-    await first.close();
+    const inFlight = first.client
+      .callTool({
+        name: "codex",
+        arguments: { prompt: "slow hi", model: "mA", "approval-policy": "on-request", sandbox: "workspace-write", cwd: env.cwd },
+      })
+      .catch(() => undefined);
+    await waitFor(() => calls(env, "turn/start").length === 1, "the first turn to be in flight");
+    process.kill(first.transport.pid as number, "SIGKILL");
+    await inFlight;
 
     const second = await connect();
-    const replied = await second.callTool({ name: "codex-reply", arguments: { threadId: "t1", prompt: "again" } });
+    const replied = await second.client.callTool({ name: "codex-reply", arguments: { threadId: "t1", prompt: "again" } });
 
     expect(replied.isError).toBeFalsy();
     expect(calls(env, "thread/resume")[0].params).toMatchObject({

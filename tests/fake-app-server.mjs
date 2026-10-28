@@ -6,7 +6,7 @@
 // `send()`/`sendServerRequest()` write json-rpc lines to stdout. each scenario is
 // just an async function built from those primitives, registered in `scenarios`
 // below -- task 5 can add more scenarios without touching this plumbing.
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 import readline from "node:readline";
 
 const scenario = process.env.FAKE_SCENARIO;
@@ -455,7 +455,8 @@ const scenarios = {
   // logs every request to $FAKE_LOG (one json line each: method + params) so a test can assert
   // what reached app-server across several processes. serves any number of threads (t1, t2, ..),
   // resumes, and turns; model "m1" supports only low/high effort. a prompt starting with "slow"
-  // holds its turn open for half a second.
+  // holds its turn open for half a second; one starting with "hold" holds it until the file
+  // $FAKE_LOG.release exists.
   async "binding-log"() {
     const init = await expect("initialize");
     replyResult(init, initializeResult);
@@ -494,6 +495,7 @@ const scenarios = {
         replyResult(msg, { turn: { id: turnId } });
         send({ method: "turn/started", params: threadStartedItem(threadId, turnId) });
         if (prompt.startsWith("slow")) await sleep(500);
+        while (prompt.startsWith("hold") && !existsSync(`${process.env.FAKE_LOG}.release`)) await sleep(20);
         await finishTurn(threadId, turnId, [{ phase: "final_answer", text: prompt }]);
       }
     }

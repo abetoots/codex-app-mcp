@@ -4,7 +4,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 import type { ThreadSettings } from "./turn-runner.js";
 
@@ -39,7 +39,10 @@ export function defaultBindingDir(env: NodeJS.ProcessEnv = process.env): string 
 }
 
 const isStringOrNull = (v: unknown): boolean => v === null || typeof v === "string";
-const isNumberOrNull = (v: unknown): boolean => v === null || typeof v === "number";
+const isIntOrNull = (v: unknown): boolean => v === null || (typeof v === "number" && Number.isInteger(v));
+// the values codex app-server accepts, as stored (on-failure is mapped to on-request before saving)
+const APPROVAL_POLICIES: readonly unknown[] = ["untrusted", "on-request", "never"];
+const SANDBOXES: readonly unknown[] = ["read-only", "workspace-write", "danger-full-access"];
 
 function validate(threadId: string, value: unknown): ThreadBinding {
   const b = value as Partial<Record<keyof ThreadBinding, unknown>> | null;
@@ -47,13 +50,14 @@ function validate(threadId: string, value: unknown): ThreadBinding {
   const ok =
     b.threadId === threadId &&
     typeof b.cwd === "string" &&
+    isAbsolute(b.cwd) &&
     isStringOrNull(b.project) &&
     isStringOrNull(b.grantId) &&
-    isNumberOrNull(b.grantRevision) &&
+    isIntOrNull(b.grantRevision) &&
     isStringOrNull(b.expiresAt) &&
     typeof b.effectiveHash === "string" &&
-    typeof b.approvalPolicy === "string" &&
-    typeof b.sandbox === "string" &&
+    APPROVAL_POLICIES.includes(b.approvalPolicy) &&
+    SANDBOXES.includes(b.sandbox) &&
     (b.model === undefined || typeof b.model === "string") &&
     typeof b.createdAt === "string";
   if (!ok) throw new BindingUnreadable(threadId, "missing or mistyped fields");
