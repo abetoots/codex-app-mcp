@@ -11,6 +11,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { AppServerClient, type AppServerClientOptions } from "./app-server-client.js";
 import { TurnRunner, type RunTurnOptions, type StartThreadOptions, type ThreadSettings } from "./turn-runner.js";
 import { createCodexTool, createCodexReplyTool, type TurnRunnerLike } from "./tools.js";
+import { GrantClient, defaultCheckerPath } from "./grant-client.js";
+import { BindingStore, defaultBindingDir } from "./thread-binding.js";
 
 export interface LazyTurnRunnerOptions {
   // builds a fresh AppServerClient for each spawn. a plain factory (rather than baking the
@@ -63,9 +65,9 @@ export function createLazyTurnRunner(options: LazyTurnRunnerOptions): TurnRunner
       const runner = await getRunner();
       return runner.startThread(startOptions);
     },
-    async ensureThread(threadId: string, fallback: ThreadSettings) {
+    async ensureThread(threadId: string, settings: ThreadSettings) {
       const runner = await getRunner();
-      return runner.ensureThread(threadId, fallback);
+      return runner.ensureThread(threadId, settings);
     },
     async runTurn(threadId: string, prompt: string, runOptions?: RunTurnOptions) {
       const runner = await getRunner();
@@ -108,10 +110,12 @@ export async function main(): Promise<void> {
 
   const server = new McpServer({ name: "codex-app-mcp", version: readOwnVersion() });
 
-  const codexTool = createCodexTool(lazyTurnRunner);
+  const deps = { bindings: new BindingStore(defaultBindingDir()), grants: new GrantClient(defaultCheckerPath()) };
+
+  const codexTool = createCodexTool(lazyTurnRunner, deps);
   server.registerTool(codexTool.name, { description: codexTool.description, inputSchema: codexTool.inputSchema }, codexTool.handler);
 
-  const codexReplyTool = createCodexReplyTool(lazyTurnRunner);
+  const codexReplyTool = createCodexReplyTool(lazyTurnRunner, deps);
   server.registerTool(
     codexReplyTool.name,
     { description: codexReplyTool.description, inputSchema: codexReplyTool.inputSchema },

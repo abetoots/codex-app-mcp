@@ -11,10 +11,11 @@ export interface ThreadSettings {
   // takes the app-server-shaped value as-is.
   approvalPolicy: "untrusted" | "on-request" | "never";
   sandbox: "read-only" | "workspace-write" | "danger-full-access";
+  // sent on thread/start and on thread/resume, so a resumed thread keeps the model it had
+  model?: string;
 }
 
 export interface StartThreadOptions extends ThreadSettings {
-  model?: string;
   baseInstructions?: string;
   developerInstructions?: string;
   config?: Record<string, unknown>;
@@ -27,6 +28,10 @@ export interface RunTurnOptions {
   // never sent as null, which would not mean "unchanged".
   model?: string;
   effort?: string;
+  // awaited once this turn has its place in the thread's queue and before turn/start is sent,
+  // so a check made before the wait can be made again after it. a throw ends the call without
+  // sending turn/start.
+  beforeStart?: () => Promise<void>;
 }
 
 export interface TurnResult {
@@ -213,8 +218,9 @@ export class TurnRunner {
   }
 
   // no-op when this instance already knows threadId is live (it started or resumed it itself);
-  // otherwise calls thread/resume so a thread from a previous process can be continued.
-  async ensureThread(threadId: string, fallback: ThreadSettings): Promise<void> {
+  // otherwise calls thread/resume with the given settings so a thread from a previous process can
+  // be continued.
+  async ensureThread(threadId: string, settings: ThreadSettings): Promise<void> {
     if (this.knownThreadIds.has(threadId)) return;
 
     // a second concurrent call for the same id joins the first's in-flight thread/resume
@@ -225,9 +231,10 @@ export class TurnRunner {
     const promise = (async (): Promise<void> => {
       await this.client.request(CLIENT_REQUESTS.threadResume, {
         threadId,
-        cwd: fallback.cwd,
-        approvalPolicy: fallback.approvalPolicy,
-        sandbox: fallback.sandbox,
+        cwd: settings.cwd,
+        approvalPolicy: settings.approvalPolicy,
+        sandbox: settings.sandbox,
+        model: settings.model,
       });
       this.knownThreadIds.add(threadId);
     })();
@@ -261,7 +268,8 @@ export class TurnRunner {
     return run;
   }
 
-  private runTurnOnce(threadId: string, prompt: string, options: RunTurnOptions): Promise<TurnResult> {
+  private async runTurnOnce(threadId: string, prompt: string, options: RunTurnOptions): Promise<TurnResult> {
+    await options.beforeStart?.();
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const declinedRequests: string[] = [];
     this.activeDeclines.set(threadId, declinedRequests);

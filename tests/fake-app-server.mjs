@@ -6,6 +6,7 @@
 // `send()`/`sendServerRequest()` write json-rpc lines to stdout. each scenario is
 // just an async function built from those primitives, registered in `scenarios`
 // below -- task 5 can add more scenarios without touching this plumbing.
+import { appendFileSync, existsSync } from "node:fs";
 import readline from "node:readline";
 
 const scenario = process.env.FAKE_SCENARIO;
@@ -447,6 +448,55 @@ const scenarios = {
         replyResult(msg, { turn: { id: "u1" } });
         send({ method: "turn/started", params: threadStartedItem(threadId, "u1") });
         await finishTurn(threadId, "u1");
+      }
+    }
+  },
+
+  // logs every request to $FAKE_LOG (one json line each: method + params) so a test can assert
+  // what reached app-server across several processes. serves any number of threads (t1, t2, ..),
+  // resumes, and turns; model "m1" supports only low/high effort. a prompt starting with "slow"
+  // holds its turn open for half a second; one starting with "hold" holds it until the file
+  // $FAKE_LOG.release exists.
+  async "binding-log"() {
+    const init = await expect("initialize");
+    replyResult(init, initializeResult);
+    await expect("initialized");
+    let threads = 0;
+    let turns = 0;
+    for (;;) {
+      const msg = await nextMessage();
+      appendFileSync(process.env.FAKE_LOG, `${JSON.stringify({ method: msg.method, params: msg.params })}\n`);
+      if (msg.method === "thread/start") {
+        threads += 1;
+        replyResult(msg, { thread: { id: `t${threads}` } });
+      } else if (msg.method === "thread/resume") {
+        replyResult(msg, { thread: { id: msg.params.threadId } });
+      } else if (msg.method === "thread/read") {
+        replyResult(msg, { thread: { id: msg.params.threadId, model: "m1" } });
+      } else if (msg.method === "model/list") {
+        replyResult(msg, {
+          data: [
+            {
+              id: "m1",
+              model: "m1",
+              supportedReasoningEfforts: [
+                { reasoningEffort: "low", description: "" },
+                { reasoningEffort: "high", description: "" },
+              ],
+            },
+          ],
+          nextCursor: null,
+        });
+      } else if (msg.method === "turn/start") {
+        turns += 1;
+        const threadId = msg.params.threadId;
+        const turnId = `u${turns}`;
+        const prompt = msg.params.input[0].text;
+        replyResult(msg, { turn: { id: turnId } });
+        send({ method: "turn/started", params: threadStartedItem(threadId, turnId) });
+        if (prompt.startsWith("slow")) await sleep(500);
+        while (prompt.startsWith("hold") && !existsSync(`${process.env.FAKE_LOG}.release`)) await sleep(20);
+        await finishTurn(threadId, turnId, [{ phase: "final_answer", text: prompt }]);
       }
     }
   },

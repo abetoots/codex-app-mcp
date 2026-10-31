@@ -1,13 +1,50 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AppServerClient } from "../src/app-server-client.js";
+import { BindingStore } from "../src/thread-binding.js";
 import { TurnRunner } from "../src/turn-runner.js";
-import { createCodexTool, createCodexReplyTool, type TurnRunnerLike } from "../src/tools.js";
+import { createCodexTool, createCodexReplyTool, type BindingDeps, type TurnRunnerLike } from "../src/tools.js";
 
 const fakeServerPath = fileURLToPath(new URL("./fake-app-server.mjs", import.meta.url));
 
 const clients: AppServerClient[] = [];
+
+// binding deps for tests that are not about bindings: a real store in a temp dir, and a grant
+// checker that allows everything with a fixed standing hash. the reply tool refuses a thread
+// with no binding, so the thread ids a test replies to are seeded.
+async function deps(...seededThreads: string[]): Promise<BindingDeps> {
+  const bindings = new BindingStore(join(mkdtempSync(join(tmpdir(), "tools-test-")), "bindings"));
+  for (const threadId of seededThreads) {
+    await bindings.save({
+      schema: 1,
+      threadId,
+      cwd: "/tmp/x",
+      project: null,
+      grantId: null,
+      grantRevision: null,
+      expiresAt: null,
+      effectiveHash: "h0",
+      approvalPolicy: "never",
+      sandbox: "read-only",
+      createdAt: "2026-10-28T00:00:00Z",
+    });
+  }
+  const decision = {
+    allowed: true,
+    reason: "no-project",
+    project: null,
+    grantRevision: null,
+    expiresAt: null,
+    roots: [],
+    effectiveHash: "h0",
+  };
+  return { bindings, grants: { check: async () => decision } };
+}
+const REPLY_THREADS = ["old-thread", "legacy-thread", "never-seen-before", "old"];
 
 function tracked(scenario: string, env: Record<string, string> = {}): AppServerClient {
   const client = new AppServerClient({
@@ -60,6 +97,7 @@ const defaultCodexInput = {
   model: undefined,
   profile: undefined,
   cwd: undefined,
+  grant: undefined,
   "approval-policy": "never" as const,
   sandbox: "read-only" as const,
   config: undefined,
@@ -73,7 +111,7 @@ const defaultCodexInput = {
 describe("codex tool", () => {
   it("happy path: default approval-policy/sandbox, threadId present, final answer text, no isError", async () => {
     const runner = await makeRunner("happy");
-    const tool = createCodexTool(runner);
+    const tool = createCodexTool(runner, await deps());
 
     const result = await tool.handler(defaultCodexInput, asExtra(fakeExtra()));
 
@@ -89,7 +127,7 @@ describe("codex tool", () => {
 
   it("a turn that completes with zero text is treated as an error, not a silent empty success", async () => {
     const runner = await makeRunner("completed-with-no-text");
-    const tool = createCodexTool(runner);
+    const tool = createCodexTool(runner, await deps());
 
     const result = await tool.handler(defaultCodexInput, asExtra(fakeExtra()));
 
@@ -108,7 +146,7 @@ describe("codex tool", () => {
 
   it("surfaces the real upstream reason (not the generic guess) when app-server sent one", async () => {
     const runner = await makeRunner("usage-limit-then-empty");
-    const tool = createCodexTool(runner);
+    const tool = createCodexTool(runner, await deps());
 
     const result = await tool.handler(defaultCodexInput, asExtra(fakeExtra()));
 
@@ -127,7 +165,7 @@ describe("codex tool", () => {
     const runTurn = vi.fn();
     const ensureThread = vi.fn();
     const stub: TurnRunnerLike = { startThread, runTurn, ensureThread };
-    const tool = createCodexTool(stub);
+    const tool = createCodexTool(stub, await deps());
 
     const result = await tool.handler({ ...defaultCodexInput, profile: "my-profile" }, asExtra(fakeExtra()));
 
@@ -142,7 +180,7 @@ describe("codex tool", () => {
 
   it("maps approval-policy 'on-failure' to 'on-request' sent to app-server, and notes the substitution", async () => {
     const runner = await makeRunner("echo-thread-start");
-    const tool = createCodexTool(runner);
+    const tool = createCodexTool(runner, await deps());
 
     const client = clients[clients.length - 1];
     const echo = waitForNotification(client, "test/echo") as Promise<{
@@ -160,7 +198,7 @@ describe("codex tool", () => {
   it("sends effort on the first turn/start, and leaves it out entirely when not given", async () => {
     for (const [effort, expected] of [["high", "high"], [undefined, undefined]] as const) {
       const runner = await makeRunner("effort-validation");
-      const tool = createCodexTool(runner);
+      const tool = createCodexTool(runner, await deps());
       const client = clients[clients.length - 1];
       const echo = waitForNotification(client, "test/echo") as Promise<{ receivedTurnStart: Record<string, unknown> }>;
 
@@ -177,7 +215,7 @@ describe("codex tool", () => {
 
   it("folds compact-prompt into developer-instructions and notes it", async () => {
     const runner = await makeRunner("happy");
-    const tool = createCodexTool(runner);
+    const tool = createCodexTool(runner, await deps());
 
     const result = await tool.handler(
       { ...defaultCodexInput, "developer-instructions": "be terse", "compact-prompt": "summarize now" },
@@ -190,7 +228,7 @@ describe("codex tool", () => {
 
   it("thread/start succeeds but turn/start itself errors -> isError, threadId still present", async () => {
     const runner = await makeRunner("turn-start-error");
-    const tool = createCodexTool(runner);
+    const tool = createCodexTool(runner, await deps());
 
     const result = await tool.handler(defaultCodexInput, asExtra(fakeExtra()));
 
@@ -201,7 +239,7 @@ describe("codex tool", () => {
 
   it("thread/start itself fails -> isError, no threadId was ever obtained so structuredContent has none", async () => {
     const runner = await makeRunner("rpc-error");
-    const tool = createCodexTool(runner);
+    const tool = createCodexTool(runner, await deps());
 
     const result = await tool.handler(defaultCodexInput, asExtra(fakeExtra()));
 
@@ -212,7 +250,7 @@ describe("codex tool", () => {
 
   it("a turn resolving with status failed -> isError, errorText present, threadId present", async () => {
     const runner = await makeRunner("failed-turn");
-    const tool = createCodexTool(runner);
+    const tool = createCodexTool(runner, await deps());
 
     const result = await tool.handler(defaultCodexInput, asExtra(fakeExtra()));
 
@@ -223,7 +261,7 @@ describe("codex tool", () => {
 
   it("a turn interrupted by caller timeout -> isError, threadId present", async () => {
     const runner = await makeRunner("hangs");
-    const tool = createCodexTool(runner);
+    const tool = createCodexTool(runner, await deps());
 
     const result = await tool.handler({ ...defaultCodexInput, "timeout-seconds": 1 }, asExtra(fakeExtra()));
 
@@ -244,7 +282,10 @@ describe("codex tool", () => {
           }),
       );
       const stub: TurnRunnerLike = { startThread, runTurn, ensureThread: vi.fn() } as unknown as TurnRunnerLike;
-      const tool = createCodexTool(stub);
+      // an instant save, so no real file i/o has to finish inside the fake-timer window
+      const stubDeps = await deps();
+      vi.spyOn(stubDeps.bindings, "save").mockResolvedValue();
+      const tool = createCodexTool(stub, stubDeps);
       const extra = fakeExtra("token-1");
 
       const handlerPromise = tool.handler(defaultCodexInput, asExtra(extra));
@@ -274,7 +315,7 @@ describe("codex tool", () => {
 
   it("does not send progress notifications when no progressToken is present", async () => {
     const runner = await makeRunner("happy");
-    const tool = createCodexTool(runner);
+    const tool = createCodexTool(runner, await deps());
     const extra = fakeExtra();
 
     await tool.handler(defaultCodexInput, asExtra(extra));
@@ -295,7 +336,7 @@ const defaultReplyInput = {
 describe("codex-reply tool", () => {
   it("happy path with threadId continues correctly, structuredContent.threadId present", async () => {
     const runner = await makeRunner("resume-then-turn");
-    const tool = createCodexReplyTool(runner);
+    const tool = createCodexReplyTool(runner, await deps(...REPLY_THREADS));
 
     const result = await tool.handler({ ...defaultReplyInput, threadId: "old-thread" }, asExtra(fakeExtra()));
 
@@ -306,7 +347,7 @@ describe("codex-reply tool", () => {
 
   it("a resumed turn that completes with zero text is treated as an error, matching the codex tool's behavior", async () => {
     const runner = await makeRunner("resume-then-empty-turn");
-    const tool = createCodexReplyTool(runner);
+    const tool = createCodexReplyTool(runner, await deps(...REPLY_THREADS));
 
     const result = await tool.handler({ ...defaultReplyInput, threadId: "old-thread" }, asExtra(fakeExtra()));
 
@@ -323,7 +364,7 @@ describe("codex-reply tool", () => {
     ];
     for (const { input, sent } of cases) {
       const runner = await makeRunner("effort-validation");
-      const tool = createCodexReplyTool(runner);
+      const tool = createCodexReplyTool(runner, await deps(...REPLY_THREADS));
       const client = clients[clients.length - 1];
       const echo = waitForNotification(client, "test/echo") as Promise<{ receivedTurnStart: Record<string, unknown> }>;
 
@@ -342,7 +383,7 @@ describe("codex-reply tool", () => {
 
   it("honors the deprecated conversationId alias when threadId is absent", async () => {
     const runner = await makeRunner("resume-then-turn");
-    const tool = createCodexReplyTool(runner);
+    const tool = createCodexReplyTool(runner, await deps(...REPLY_THREADS));
 
     const result = await tool.handler({ ...defaultReplyInput, conversationId: "legacy-thread" }, asExtra(fakeExtra()));
 
@@ -350,9 +391,9 @@ describe("codex-reply tool", () => {
     expect(result.structuredContent).toMatchObject({ threadId: "legacy-thread" });
   });
 
-  it("rejects a call with neither threadId nor conversationId via zod validation, without crashing", () => {
+  it("rejects a call with neither threadId nor conversationId via zod validation, without crashing", async () => {
     const runner = { startThread: vi.fn(), ensureThread: vi.fn(), runTurn: vi.fn() } as unknown as TurnRunnerLike;
-    const tool = createCodexReplyTool(runner);
+    const tool = createCodexReplyTool(runner, await deps(...REPLY_THREADS));
 
     const parsed = tool.inputSchema.safeParse({ prompt: "hi" });
 
@@ -364,7 +405,7 @@ describe("codex-reply tool", () => {
 
   it("calls ensureThread for a threadId unknown to this process, and resolves via thread/resume without error", async () => {
     const runner = await makeRunner("resume-then-turn");
-    const tool = createCodexReplyTool(runner);
+    const tool = createCodexReplyTool(runner, await deps(...REPLY_THREADS));
 
     const result = await tool.handler({ ...defaultReplyInput, threadId: "never-seen-before" }, asExtra(fakeExtra()));
 
@@ -374,7 +415,7 @@ describe("codex-reply tool", () => {
 
   it("ensureThread rejecting (thread/resume itself returns a JSON-RPC error) -> isError:true with a sensible message", async () => {
     const runner = await makeRunner("resume-error");
-    const tool = createCodexReplyTool(runner);
+    const tool = createCodexReplyTool(runner, await deps(...REPLY_THREADS));
 
     const result = await tool.handler({ ...defaultReplyInput, threadId: "old-thread" }, asExtra(fakeExtra()));
 
@@ -385,7 +426,7 @@ describe("codex-reply tool", () => {
 
   it("runTurn rejecting (turn/start errors after a successful resume) still reports structuredContent.threadId", async () => {
     const runner = await makeRunner("resume-then-turn-start-error");
-    const tool = createCodexReplyTool(runner);
+    const tool = createCodexReplyTool(runner, await deps(...REPLY_THREADS));
 
     const result = await tool.handler({ ...defaultReplyInput, threadId: "old-thread" }, asExtra(fakeExtra()));
 
@@ -410,7 +451,7 @@ describe("effort validation", () => {
   it("codex: rejects an effort the thread's model doesn't support, without sending a turn", async () => {
     const runner = await makeRunner("effort-validation");
     const turn = turnStartSent(clients[clients.length - 1]);
-    const tool = createCodexTool(runner);
+    const tool = createCodexTool(runner, await deps());
 
     const result = await tool.handler({ ...defaultCodexInput, effort: "turbo" }, asExtra(fakeExtra()));
 
@@ -427,7 +468,7 @@ describe("effort validation", () => {
   it("codex: lets a supported effort through", async () => {
     const runner = await makeRunner("effort-validation");
     const turn = turnStartSent(clients[clients.length - 1]);
-    const tool = createCodexTool(runner);
+    const tool = createCodexTool(runner, await deps());
 
     const result = await tool.handler({ ...defaultCodexInput, effort: "high" }, asExtra(fakeExtra()));
 
@@ -438,7 +479,7 @@ describe("effort validation", () => {
   it("codex-reply: checks effort against an explicit model override", async () => {
     const runner = await makeRunner("effort-validation");
     const turn = turnStartSent(clients[clients.length - 1]);
-    const tool = createCodexReplyTool(runner);
+    const tool = createCodexReplyTool(runner, await deps(...REPLY_THREADS));
 
     const result = await tool.handler(
       { ...defaultReplyInput, threadId: "old", model: "m1", effort: "max" },
@@ -454,7 +495,7 @@ describe("effort validation", () => {
   it("codex-reply: checks effort against the thread's current model when no model is given", async () => {
     const runner = await makeRunner("effort-validation");
     const turn = turnStartSent(clients[clients.length - 1]);
-    const tool = createCodexReplyTool(runner);
+    const tool = createCodexReplyTool(runner, await deps(...REPLY_THREADS));
 
     const rejected = await tool.handler({ ...defaultReplyInput, threadId: "old", effort: "turbo" }, asExtra(fakeExtra()));
     expect(rejected.isError).toBe(true);
@@ -468,7 +509,7 @@ describe("effort validation", () => {
   it("does not block a model codex doesn't list, so validation can't lock out new models", async () => {
     const runner = await makeRunner("effort-validation");
     const turn = turnStartSent(clients[clients.length - 1]);
-    const tool = createCodexReplyTool(runner);
+    const tool = createCodexReplyTool(runner, await deps(...REPLY_THREADS));
 
     const result = await tool.handler(
       { ...defaultReplyInput, threadId: "old", model: "brand-new-model", effort: "turbo" },

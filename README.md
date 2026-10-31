@@ -50,10 +50,11 @@ existing skills/tooling that call `mcp__codex__codex` /
 | `prompt` | string | — | required |
 | `model` | string | Codex config | model for the new thread |
 | `effort` | string | Codex config | reasoning effort; see note below |
-| `cwd` | string | server cwd | optional |
+| `cwd` | string | server cwd | the thread is bound to this directory's real path |
+| `grant` | string | — | optional session grant id, checked with the hub's grant checker |
 | `approval-policy` | `untrusted \| on-failure \| on-request \| never` | `never` | `on-failure` maps to `on-request` — app-server dropped that value |
 | `sandbox` | `read-only \| workspace-write \| danger-full-access` | `read-only` | |
-| `config` | object | — | optional |
+| `config` | — | — | refused when present: a thread gets MCP servers only from the project's files |
 | `base-instructions` | string | — | optional |
 | `developer-instructions` | string | — | optional |
 | `compact-prompt` | string | — | folded into `developer-instructions` |
@@ -67,6 +68,7 @@ existing skills/tooling that call `mcp__codex__codex` /
 | `threadId` | string | — | required, or use `conversationId` |
 | `conversationId` | string | — | deprecated alias for `threadId` |
 | `prompt` | string | — | required |
+| `cwd` | string | bound cwd | optional; refused unless it is the directory the thread was started in |
 | `model` | string | thread's current | switches the thread from this turn on |
 | `effort` | string | thread's current | switches the thread from this turn on |
 | `timeout-seconds` | number | `900` | |
@@ -78,6 +80,19 @@ whatever the thread last used. Valid `effort` values depend on the model (for
 requested effort against the model's advertised list and refuses it, without
 sending anything, if it isn't there. Codex itself would store an invalid value
 and fail every later turn on that thread.
+
+### Thread bindings
+
+`codex` asks the grant checker (`AI_GRANT_CHECK`, default
+`$HOME/ai-cli-sync/bin/grant-check`) before it starts a thread, then records the
+thread's cwd, project, grant, standing-scope hash, approval policy, sandbox and
+model in `CODEX_MCP_STATE_DIR` (default `~/.local/state/codex-app-mcp/bindings`;
+directory 0700, files 0600). `codex-reply` takes all of these from the binding,
+never from the caller: a thread with no readable binding is refused, the grant
+is checked again (`phase: resume`) before the thread is resumed and again once
+the turn reaches the front of the thread's queue, and a changed standing scope
+means starting a new thread. A model switched by a reply is written back to the
+binding, so a restart resumes on it. A checker that cannot run denies.
 
 ### Result shape (both tools)
 

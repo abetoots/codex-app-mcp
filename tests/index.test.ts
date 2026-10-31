@@ -5,6 +5,9 @@
 // tests/stdio.test.ts covers that: it spawns the actual built entry point and talks MCP over its
 // real stdio transport. Task 7's live.smoke.test.ts does neither -- it calls tools.ts directly
 // against the real `codex app-server`, bypassing the stdio layer just like this file does.
+import { mkdtempSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -20,11 +23,11 @@ afterEach(() => {
   for (const client of clients.splice(0)) client.close();
 });
 
-function makeClient(scenario: string): AppServerClient {
+function makeClient(scenario: string, env: Record<string, string> = {}): AppServerClient {
   const client = new AppServerClient({
     command: process.execPath,
     args: [fakeServerPath],
-    env: { ...process.env, FAKE_SCENARIO: scenario },
+    env: { ...process.env, FAKE_SCENARIO: scenario, ...env },
   });
   clients.push(client);
   return client;
@@ -79,5 +82,18 @@ describe("createLazyTurnRunner", () => {
     // call should spawn a brand new client rather than reusing (or hanging on) the dead one
     await lazy.startThread(readOnlySettings);
     expect(spawnCount).toBe(2);
+  });
+
+  it("passes the stored settings, model included, through to thread/resume, and beforeStart to the turn", async () => {
+    const logFile = join(mkdtempSync(join(tmpdir(), "index-test-")), "app-server.log");
+    const lazy = createLazyTurnRunner({ createClient: () => makeClient("binding-log", { FAKE_LOG: logFile }) });
+    let before = 0;
+
+    await lazy.ensureThread("old", { cwd: "/tmp/x", approvalPolicy: "on-request", sandbox: "workspace-write", model: "mA" });
+    await lazy.runTurn("old", "hi", { beforeStart: async () => void (before += 1) });
+
+    const resume = readFileSync(logFile, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).find((l) => l.method === "thread/resume");
+    expect(resume.params).toMatchObject({ threadId: "old", cwd: "/tmp/x", sandbox: "workspace-write", model: "mA" });
+    expect(before).toBe(1);
   });
 });
