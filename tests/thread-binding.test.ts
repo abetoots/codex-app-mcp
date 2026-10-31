@@ -269,7 +269,7 @@ describe("GrantClient", () => {
     expect((await env.grants.check(req)).reason).toBe("revoked");
 
     setFixture(env, { exit: 3 });
-    await expect(env.grants.check(req)).rejects.toThrow(/exited 3/);
+    await expect(env.grants.check(req)).rejects.toThrow(/exited 3.*unscoped test server.*run bin\/plan to see why/);
     await expect(new GrantClient(join(env.dir, "absent")).check(req)).rejects.toThrow();
   });
 });
