@@ -20,6 +20,7 @@ export interface ThreadBinding {
   approvalPolicy: ThreadSettings["approvalPolicy"];
   sandbox: ThreadSettings["sandbox"];
   model?: string;
+  ticketId?: string;
   createdAt: string;
 }
 
@@ -59,6 +60,7 @@ function validate(threadId: string, value: unknown): ThreadBinding {
     APPROVAL_POLICIES.includes(b.approvalPolicy) &&
     SANDBOXES.includes(b.sandbox) &&
     (b.model === undefined || typeof b.model === "string") &&
+    (b.ticketId === undefined || (typeof b.ticketId === "string" && /^[0-9a-f]{32}$/.test(b.ticketId))) &&
     typeof b.createdAt === "string";
   if (!ok) throw new BindingUnreadable(threadId, "missing or mistyped fields");
   return b as unknown as ThreadBinding;

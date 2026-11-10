@@ -21,6 +21,7 @@ import { TurnRunner } from "../src/turn-runner.js";
 
 const fakeServerPath = fileURLToPath(new URL("./fake-app-server.mjs", import.meta.url));
 const fakeCheckerSource = fileURLToPath(new URL("./fake-grant-check.mjs", import.meta.url));
+const fakeTicketSource = fileURLToPath(new URL("./fake-ticket-helper.mjs", import.meta.url));
 const distEntry = fileURLToPath(new URL("../dist/index.js", import.meta.url));
 
 interface Env {
@@ -103,6 +104,7 @@ afterEach(async () => {
   for (const c of clients.splice(0)) c.close();
   for (const c of mcpClients.splice(0)) await c.close();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 
 // a fresh app-server child + runner + tools over env's store: calling it again is a "restart"
@@ -147,6 +149,84 @@ const replyInput = {
 };
 
 const textOf = (r: { content: Array<{ type: string; text?: string }> }): string => r.content.map((c) => c.text ?? "").join("\n");
+
+describe("delegation tickets", () => {
+  it("issues distinct tickets bound to each thread and restores their configs after restart", async () => {
+    const env = makeEnv({ decision: granted({ expires_at: "2026-01-01T00:00:00Z" }) });
+    const helper = join(env.dir, "ticket-helper.mjs");
+    copyFileSync(fakeTicketSource, helper);
+    chmodSync(helper, 0o755);
+    vi.stubEnv("AI_DELEGATION_TICKET_HELPER", helper);
+    vi.stubEnv("CLAUDE_DELEGATE_MCP_BIN", "/delegate/index.js");
+    const { codex } = await boot(env);
+    const first = await codex.handler({ ...codexInput, cwd: env.cwd, grant: "g1" }, extra);
+    const second = await codex.handler({ ...codexInput, cwd: env.cwd, grant: "g1" }, extra);
+    expect(first.isError).toBeFalsy();
+    expect(second.isError).toBeFalsy();
+    const starts = calls(env, "thread/start");
+    const entry = starts[0].params.config.mcp_servers.claude;
+    expect(entry).toEqual({ command: "node", args: ["/delegate/index.js"], env: { AI_DELEGATION_TICKET: expect.stringMatching(/^[0-9a-f]{32}$/) }, default_tools_approval_mode: "approve" });
+    expect(starts[1].params.config.mcp_servers.claude.env.AI_DELEGATION_TICKET).not.toBe(entry.env.AI_DELEGATION_TICKET);
+    const requests = lines(join(env.dir, "tickets.log"));
+    expect(requests).toHaveLength(2);
+    expect(requests[0]).toMatchObject({ parent_harness: "codex", dispatch_id: expect.any(String), cwd: env.cwd, add_dirs: [], project: "p1", grant_id: "g1", revision: 1, effective_hash: "h1", expires_at: "2026-01-01T00:00:00Z" });
+    expect(requests[1].dispatch_id).not.toBe(requests[0].dispatch_id);
+    const restarted = await boot(env);
+    expect((await restarted.reply.handler({ ...replyInput, threadId: "t1" }, extra)).isError).toBeFalsy();
+    expect(calls(env, "thread/resume")[0].params.config.mcp_servers.claude).toEqual(entry);
+    expect(lines(join(env.dir, "tickets.log"))).toHaveLength(2);
+  });
+
+  it.each(["missing", "exit", "malformed"])("continues without delegation when the helper is %s", async (mode) => {
+    const env = makeEnv();
+    const helper = join(env.dir, "ticket-helper.mjs");
+    if (mode !== "missing") {
+      copyFileSync(fakeTicketSource, helper);
+      chmodSync(helper, 0o755);
+      writeFileSync(join(env.dir, "ticket-mode"), mode);
+    }
+    vi.stubEnv("AI_DELEGATION_TICKET_HELPER", helper);
+    const { codex } = await boot(env);
+    const result = await codex.handler({ ...codexInput, cwd: env.cwd }, extra);
+    expect(result.isError).toBeFalsy();
+    expect(textOf(result)).toMatch(/delegation is unavailable/i);
+    expect(calls(env, "thread/start")[0].params.config).toBeUndefined();
+    const restarted = await boot(env);
+    await restarted.reply.handler({ ...replyInput, threadId: "t1" }, extra);
+    expect(calls(env, "thread/resume")[0].params.config).toBeUndefined();
+  });
+
+  it("caps ticket expiry at eight hours when the grant has no expiry", async () => {
+    const env = makeEnv();
+    const helper = join(env.dir, "ticket-helper.mjs");
+    copyFileSync(fakeTicketSource, helper);
+    chmodSync(helper, 0o755);
+    vi.stubEnv("AI_DELEGATION_TICKET_HELPER", helper);
+    const { codex } = await boot(env);
+    const before = Date.now();
+    await codex.handler({ ...codexInput, cwd: env.cwd }, extra);
+    const after = Date.now();
+    const expiry = Date.parse(lines(join(env.dir, "tickets.log"))[0].expires_at);
+    expect(expiry).toBeGreaterThanOrEqual(before + 8 * 60 * 60 * 1000 - 1000);
+    expect(expiry).toBeLessThanOrEqual(after + 8 * 60 * 60 * 1000);
+  });
+
+  it("refuses caller-supplied MCP server config before starting a thread", async () => {
+    const env = makeEnv();
+    const { codex } = await boot(env);
+    const result = await codex.handler({ ...codexInput, cwd: env.cwd, config: { mcp_servers: { claude: { env: { AI_DELEGATION_TICKET: "caller" } } } } }, extra);
+    expect(result.isError).toBe(true);
+    expect(calls(env, "thread/start")).toHaveLength(0);
+  });
+
+  it("does not pass an inherited ticket to app-server", async () => {
+    const env = makeEnv();
+    vi.stubEnv("AI_DELEGATION_TICKET", "inherited");
+    const { codex } = await boot(env);
+    await codex.handler({ ...codexInput, cwd: env.cwd }, extra);
+    expect(calls(env, "test/env")[0].hasTicket).toBe(false);
+  });
+});
 
 describe("BindingStore", () => {
   const binding = (threadId: string): ThreadBinding => ({

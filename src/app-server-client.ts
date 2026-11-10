@@ -86,10 +86,12 @@ export class AppServerClient {
   constructor(options: AppServerClientOptions = {}) {
     const command = options.command ?? process.env.CODEX_BIN ?? "codex";
     const args = options.args ?? DEFAULT_ARGS;
+    const env = { ...(options.env ?? process.env) };
+    delete env.AI_DELEGATION_TICKET;
 
     this.child = spawn(command, args, {
       cwd: options.cwd,
-      env: options.env ?? process.env,
+      env,
       stdio: ["pipe", "pipe", "pipe"],
     });
 

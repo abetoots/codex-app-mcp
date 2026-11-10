@@ -116,7 +116,7 @@ describe("codex tool", () => {
     const result = await tool.handler(defaultCodexInput, asExtra(fakeExtra()));
 
     expect(result.isError).toBeFalsy();
-    expect(result.content).toEqual([{ type: "text", text: "pong" }]);
+    expect(result.content).toEqual([{ type: "text", text: expect.stringContaining("pong") }]);
     expect(result.structuredContent).toMatchObject({
       threadId: "t1",
       turnId: "u1",

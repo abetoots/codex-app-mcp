@@ -113,8 +113,8 @@ describe("real MCP stdio surface (node dist/index.js over stdio)", () => {
 
     const result = await c.callTool({ name: "codex", arguments: { prompt: "hi" } });
 
-    expect(result.content).toEqual([{ type: "text", text: "pong" }]);
-    expect(result.structuredContent).toMatchObject({ threadId: "t1", content: "pong" });
+    expect(result.content).toEqual([{ type: "text", text: expect.stringContaining("pong") }]);
+    expect(result.structuredContent).toMatchObject({ threadId: "t1", content: (result.content as Array<{ text: string }>)[0].text });
   });
 
   it("lists codex and codex-reply with schemas reflecting the documented defaults", async () => {
@@ -158,7 +158,7 @@ describe("real MCP stdio surface (node dist/index.js over stdio)", () => {
     const result = await c.callTool({ name: "codex", arguments: { prompt: "hi" } });
 
     expect(result.isError).toBeFalsy();
-    expect(result.content).toEqual([{ type: "text", text: "pong" }]);
+    expect(result.content).toEqual([{ type: "text", text: expect.stringContaining("pong") }]);
     expect((result.structuredContent as { threadId?: string }).threadId).toBe("t1");
     expect((result.structuredContent as { status?: string }).status).toBe("completed");
   });

@@ -458,6 +458,7 @@ const scenarios = {
   // holds its turn open for half a second; one starting with "hold" holds it until the file
   // $FAKE_LOG.release exists.
   async "binding-log"() {
+    appendFileSync(process.env.FAKE_LOG, `${JSON.stringify({ method: "test/env", hasTicket: "AI_DELEGATION_TICKET" in process.env })}\n`);
     const init = await expect("initialize");
     replyResult(init, initializeResult);
     await expect("initialized");
