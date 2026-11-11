@@ -152,7 +152,8 @@ const textOf = (r: { content: Array<{ type: string; text?: string }> }): string 
 
 describe("delegation tickets", () => {
   it("issues distinct tickets bound to each thread and restores their configs after restart", async () => {
-    const env = makeEnv({ decision: granted({ expires_at: "2026-01-01T00:00:00Z" }) });
+    const grantExpiry = new Date(Date.now() + 60 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, "Z");
+    const env = makeEnv({ decision: granted({ expires_at: grantExpiry }) });
     const helper = join(env.dir, "ticket-helper.mjs");
     copyFileSync(fakeTicketSource, helper);
     chmodSync(helper, 0o755);
@@ -169,7 +170,7 @@ describe("delegation tickets", () => {
     expect(starts[1].params.config.mcp_servers.claude.env.AI_DELEGATION_TICKET).not.toBe(entry.env.AI_DELEGATION_TICKET);
     const requests = lines(join(env.dir, "tickets.log"));
     expect(requests).toHaveLength(2);
-    expect(requests[0]).toMatchObject({ parent_harness: "codex", dispatch_id: expect.any(String), cwd: env.cwd, add_dirs: [], project: "p1", grant_id: "g1", revision: 1, effective_hash: "h1", expires_at: "2026-01-01T00:00:00Z" });
+    expect(requests[0]).toMatchObject({ parent_harness: "codex", dispatch_id: expect.any(String), cwd: env.cwd, add_dirs: [], project: "p1", grant_id: "g1", revision: 1, effective_hash: "h1", expires_at: grantExpiry });
     expect(requests[1].dispatch_id).not.toBe(requests[0].dispatch_id);
     const restarted = await boot(env);
     expect((await restarted.reply.handler({ ...replyInput, threadId: "t1" }, extra)).isError).toBeFalsy();
@@ -209,6 +210,29 @@ describe("delegation tickets", () => {
     const expiry = Date.parse(lines(join(env.dir, "tickets.log"))[0].expires_at);
     expect(expiry).toBeGreaterThanOrEqual(before + 8 * 60 * 60 * 1000 - 1000);
     expect(expiry).toBeLessThanOrEqual(after + 8 * 60 * 60 * 1000);
+  });
+
+  it.each([
+    ["earlier", 60 * 60 * 1000],
+    ["later", 10 * 60 * 60 * 1000],
+  ])("uses the earlier of the eight-hour deadline and a grant expiry that is %s", async (which, offset) => {
+    const grantExpiry = new Date(Date.now() + offset).toISOString().replace(/\.\d{3}Z$/, "Z");
+    const env = makeEnv({ decision: granted({ expires_at: grantExpiry }) });
+    const helper = join(env.dir, "ticket-helper.mjs");
+    copyFileSync(fakeTicketSource, helper);
+    chmodSync(helper, 0o755);
+    vi.stubEnv("AI_DELEGATION_TICKET_HELPER", helper);
+    const { codex } = await boot(env);
+    const before = Date.now();
+    await codex.handler({ ...codexInput, cwd: env.cwd, grant: "g1" }, extra);
+    const after = Date.now();
+    const issuedExpiry = lines(join(env.dir, "tickets.log"))[0].expires_at;
+    if (which === "earlier") {
+      expect(issuedExpiry).toBe(grantExpiry);
+    } else {
+      expect(Date.parse(issuedExpiry)).toBeGreaterThanOrEqual(before + 8 * 60 * 60 * 1000 - 1000);
+      expect(Date.parse(issuedExpiry)).toBeLessThanOrEqual(after + 8 * 60 * 60 * 1000);
+    }
   });
 
   it("refuses caller-supplied MCP server config before starting a thread", async () => {
