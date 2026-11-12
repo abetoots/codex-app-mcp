@@ -53,6 +53,7 @@ describe("real MCP stdio surface (node dist/index.js over stdio)", () => {
       AI_GRANT_CHECK: fakeChecker,
       CODEX_MCP_STATE_DIR: join(bindingDir, "bindings"),
       ...extra,
+      AI_DELEGATION_TICKET_HELPER: join(bindingDir, "missing-ticket-helper"),
     };
   }
 
@@ -103,7 +104,7 @@ describe("real MCP stdio surface (node dist/index.js over stdio)", () => {
     expect(c.getServerVersion()?.version).toBe(pkgVersion);
   });
 
-  it("mirrors the answer text into structuredContent.content, since some clients drop content when structuredContent is present", async () => {
+  it("mirrors the answer and delegation-unavailable note into structuredContent.content", async () => {
     // the original codex mcp-server did this deliberately (codex_tool_runner.rs, rust-v0.151.0:
     // "Some MCP clients ignore `content` when `structuredContent` is present, so mirror the
     // text there as well"). claude code is such a client: without the mirror the calling model
@@ -113,8 +114,8 @@ describe("real MCP stdio surface (node dist/index.js over stdio)", () => {
 
     const result = await c.callTool({ name: "codex", arguments: { prompt: "hi" } });
 
-    expect(result.content).toEqual([{ type: "text", text: "pong" }]);
-    expect(result.structuredContent).toMatchObject({ threadId: "t1", content: "pong" });
+    expect(result.content).toEqual([{ type: "text", text: "Delegation is unavailable for this thread.\n\npong" }]);
+    expect(result.structuredContent).toMatchObject({ threadId: "t1", content: "Delegation is unavailable for this thread.\n\npong" });
   });
 
   it("lists codex and codex-reply with schemas reflecting the documented defaults", async () => {
@@ -152,13 +153,13 @@ describe("real MCP stdio surface (node dist/index.js over stdio)", () => {
     expect(replySchema.properties.effort).toBeDefined();
   });
 
-  it("calls codex over the real transport and returns wire-level content + structuredContent", async () => {
+  it("returns the delegation-unavailable note and answer over the real transport", async () => {
     const c = await connect("happy");
 
     const result = await c.callTool({ name: "codex", arguments: { prompt: "hi" } });
 
     expect(result.isError).toBeFalsy();
-    expect(result.content).toEqual([{ type: "text", text: "pong" }]);
+    expect(result.content).toEqual([{ type: "text", text: "Delegation is unavailable for this thread.\n\npong" }]);
     expect((result.structuredContent as { threadId?: string }).threadId).toBe("t1");
     expect((result.structuredContent as { status?: string }).status).toBe("completed");
   });

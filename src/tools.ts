@@ -2,6 +2,7 @@
 // mcp-server`'s 0.151.0 field set over a TurnRunner so the multi-model/gauntlet skills need zero
 // changes. knows nothing about stdio/child-process wiring -- src/index.ts owns that.
 import { realpathSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { z } from "zod";
 import type { CallToolResult, ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
@@ -11,6 +12,7 @@ import type { ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { GrantClient, GrantDecision, GrantRequest } from "./grant-client.js";
 import type { BindingStore, ThreadBinding } from "./thread-binding.js";
 import type { RunTurnOptions, StartThreadOptions, SupportedEfforts, ThreadSettings, TurnResult } from "./turn-runner.js";
+import { delegateConfig, issueTicket } from "./ticket-client.js";
 
 // the subset of TurnRunner's public surface these tools call -- a structural interface (rather
 // than importing the TurnRunner class type itself) so src/index.ts's lazy-spawn/respawn wrapper
@@ -286,6 +288,7 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
       return { isError: true, content: [{ type: "text", text: CONFIG_UNSUPPORTED_TEXT }] };
     }
 
+    const dispatchId = randomUUID();
     // a thread without a cwd would run wherever app-server happens to be; bind it to ours
     const cwd = realPath(input.cwd ?? process.cwd());
     const startRequest: GrantRequest = {
@@ -305,6 +308,18 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
     }
 
     const notes: string[] = [];
+    let ticketId: string | undefined;
+    try {
+      const deadline = Date.now() + 8 * 60 * 60 * 1000;
+      const expiry = decision.expiresAt === null ? deadline : Math.min(deadline, Date.parse(decision.expiresAt));
+      ticketId = await issueTicket({
+        parent_harness: "codex", dispatch_id: dispatchId, cwd, add_dirs: [], project: decision.project,
+        grant_id: startRequest.grantId, revision: decision.grantRevision, effective_hash: decision.effectiveHash,
+        expires_at: new Date(expiry).toISOString().replace(/\.\d{3}Z$/, "Z"),
+      });
+    } catch {
+      notes.push("Delegation is unavailable for this thread.");
+    }
     if (input["approval-policy"] === "on-failure") notes.push(ON_FAILURE_NOTE);
     const approvalPolicy = APPROVAL_POLICY_MAP[input["approval-policy"]];
 
@@ -325,6 +340,7 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
         sandbox: input.sandbox,
         baseInstructions: input["base-instructions"],
         developerInstructions,
+        ...(ticketId !== undefined ? { config: delegateConfig(ticketId) } : {}),
       });
       const startedId = started.threadId;
 
@@ -341,6 +357,7 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
         effectiveHash: decision.effectiveHash,
         approvalPolicy,
         sandbox: input.sandbox,
+        ...(ticketId !== undefined ? { ticketId } : {}),
         ...(input.model !== undefined ? { model: input.model } : {}),
         createdAt: new Date().toISOString(),
       };
@@ -475,6 +492,7 @@ export function createCodexReplyTool(turnRunner: TurnRunnerLike, deps: BindingDe
         approvalPolicy: bound.approvalPolicy,
         sandbox: bound.sandbox,
         model: bound.model,
+        ...(bound.ticketId !== undefined ? { config: delegateConfig(bound.ticketId) } : {}),
       });
       const invalidEffort = await effortError(turnRunner, input.effort, { model: input.model, threadId });
       if (invalidEffort !== undefined) return buildRejectedResult(new Error(invalidEffort), threadId, []);

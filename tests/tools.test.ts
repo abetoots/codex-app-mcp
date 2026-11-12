@@ -109,14 +109,14 @@ const defaultCodexInput = {
 };
 
 describe("codex tool", () => {
-  it("happy path: default approval-policy/sandbox, threadId present, final answer text, no isError", async () => {
+  it("returns the answer and delegation-unavailable note with default settings", async () => {
     const runner = await makeRunner("happy");
     const tool = createCodexTool(runner, await deps());
 
     const result = await tool.handler(defaultCodexInput, asExtra(fakeExtra()));
 
     expect(result.isError).toBeFalsy();
-    expect(result.content).toEqual([{ type: "text", text: "pong" }]);
+    expect(result.content).toEqual([{ type: "text", text: "Delegation is unavailable for this thread.\n\npong" }]);
     expect(result.structuredContent).toMatchObject({
       threadId: "t1",
       turnId: "u1",

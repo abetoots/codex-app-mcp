@@ -13,12 +13,12 @@ export interface ThreadSettings {
   sandbox: "read-only" | "workspace-write" | "danger-full-access";
   // sent on thread/start and on thread/resume, so a resumed thread keeps the model it had
   model?: string;
+  config?: Record<string, unknown>;
 }
 
 export interface StartThreadOptions extends ThreadSettings {
   baseInstructions?: string;
   developerInstructions?: string;
-  config?: Record<string, unknown>;
 }
 
 export interface RunTurnOptions {
@@ -235,6 +235,7 @@ export class TurnRunner {
         approvalPolicy: settings.approvalPolicy,
         sandbox: settings.sandbox,
         model: settings.model,
+        config: settings.config,
       });
       this.knownThreadIds.add(threadId);
     })();
