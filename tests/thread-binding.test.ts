@@ -5,6 +5,7 @@
 // server process spawns the built dist/index.js.
 import { copyFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -165,17 +166,49 @@ describe("delegation tickets", () => {
     expect(first.isError).toBeFalsy();
     expect(second.isError).toBeFalsy();
     const starts = calls(env, "thread/start");
-    const entry = starts[0].params.config.mcp_servers.claude;
-    expect(entry).toEqual({ command: "node", args: ["/delegate/index.js"], env: { AI_DELEGATION_TICKET: expect.stringMatching(/^[0-9a-f]{32}$/) }, default_tools_approval_mode: "approve" });
-    expect(starts[1].params.config.mcp_servers.claude.env.AI_DELEGATION_TICKET).not.toBe(entry.env.AI_DELEGATION_TICKET);
+    const entry = { command: "node", args: ["/delegate/index.js"], env: { AI_DELEGATION_TICKET: expect.stringMatching(/^[0-9a-f]{32}$/) }, default_tools_approval_mode: "approve", tool_timeout_sec: 1860 };
+    expect(starts[0].params.config.mcp_servers.claude).toEqual(entry);
+    const ticketId = starts[0].params.config.mcp_servers.claude.env.AI_DELEGATION_TICKET;
+    expect(starts[1].params.config.mcp_servers.claude.env.AI_DELEGATION_TICKET).not.toBe(ticketId);
     const requests = lines(join(env.dir, "tickets.log"));
     expect(requests).toHaveLength(2);
-    expect(requests[0]).toMatchObject({ parent_harness: "codex", dispatch_id: expect.any(String), cwd: env.cwd, add_dirs: [], project: "p1", grant_id: "g1", revision: 1, effective_hash: "h1", expires_at: grantExpiry });
+    expect(requests[0]).toEqual({ parent_harness: "codex", dispatch_id: expect.any(String), cwd: env.cwd, add_dirs: [], project: "p1", grant_id: "g1", revision: 1, effective_hash: "h1", expires_at: grantExpiry });
     expect(requests[1].dispatch_id).not.toBe(requests[0].dispatch_id);
     const restarted = await boot(env);
     expect((await restarted.reply.handler({ ...replyInput, threadId: "t1" }, extra)).isError).toBeFalsy();
-    expect(calls(env, "thread/resume")[0].params.config.mcp_servers.claude).toEqual(entry);
+    expect(calls(env, "thread/resume")[0].params.config.mcp_servers.claude).toEqual({ ...entry, env: { AI_DELEGATION_TICKET: ticketId } });
     expect(lines(join(env.dir, "tickets.log"))).toHaveLength(2);
+  });
+
+  it("does not issue a ticket when the grant is refused", async () => {
+    const env = makeEnv({ decision: denied("revoked") });
+    const helper = join(env.dir, "ticket-helper.mjs");
+    copyFileSync(fakeTicketSource, helper);
+    chmodSync(helper, 0o755);
+    vi.stubEnv("AI_DELEGATION_TICKET_HELPER", helper);
+    const { codex } = await boot(env);
+    const result = await codex.handler({ ...codexInput, cwd: env.cwd, grant: "g1" }, extra);
+    expect(lines(join(env.dir, "tickets.log"))).toEqual([]);
+    expect(result.isError).toBe(true);
+    expect(calls(env, "thread/start")).toHaveLength(0);
+  });
+
+  it.each([
+    ["missing field", { revision: undefined }],
+    ["extra field", { extra: true }],
+    ["relative cwd", { cwd: "relative" }],
+    ["relative add_dirs", { add_dirs: ["/absolute", "relative"] }],
+    ["malformed expiry", { expires_at: "2026-11-12T12:34:56.000Z" }],
+    ["invalid expiry", { expires_at: "2026-02-30T12:34:56Z" }],
+    ["year zero", { expires_at: "0000-01-01T00:00:00Z" }],
+  ])("fake ticket helper rejects %s", (_name, changes) => {
+    const env = makeEnv();
+    const helper = join(env.dir, "ticket-helper.mjs");
+    copyFileSync(fakeTicketSource, helper);
+    const request = { parent_harness: "codex", dispatch_id: "d1", cwd: "/project", add_dirs: [], project: "p1", grant_id: "g1", revision: 1, effective_hash: "h1", expires_at: "2099-01-01T00:00:00Z", ...changes };
+    const result = spawnSync(process.execPath, [helper, "issue"], { input: JSON.stringify(request), encoding: "utf8" });
+    expect(result.status).toBe(2);
+    expect(JSON.parse(result.stdout)).toEqual({ allowed: false, reason: "bad-request" });
   });
 
   it.each(["missing", "exit", "malformed"])("continues without delegation when the helper is %s", async (mode) => {

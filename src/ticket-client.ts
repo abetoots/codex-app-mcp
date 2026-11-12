@@ -30,5 +30,6 @@ export function delegateConfig(ticketId: string): Record<string, unknown> {
     args: [process.env.CLAUDE_DELEGATE_MCP_BIN ?? join(homedir(), "claude-delegate-mcp", "dist", "index.js")],
     env: { AI_DELEGATION_TICKET: ticketId },
     default_tools_approval_mode: "approve",
+    tool_timeout_sec: 1860,
   } } };
 }
