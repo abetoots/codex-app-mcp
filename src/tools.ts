@@ -1,9 +1,11 @@
 // zod schemas + handlers for the `codex` / `codex-reply` tools, re-exposing the removed `codex
 // mcp-server`'s 0.151.0 field set over a TurnRunner so the multi-model/gauntlet skills need zero
 // changes. knows nothing about stdio/child-process wiring -- src/index.ts owns that.
-import { realpathSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
 import { z } from "zod";
 import type { CallToolResult, ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
@@ -11,14 +13,14 @@ import type { ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
 
 import type { GrantClient, GrantDecision, GrantRequest } from "./grant-client.js";
 import type { BindingStore, ThreadBinding } from "./thread-binding.js";
-import type { RunTurnOptions, StartThreadOptions, SupportedEfforts, ThreadSettings, TurnResult } from "./turn-runner.js";
+import type { RunTurnOptions, StartThreadOptions, SupportedEfforts, ThreadSettings, TurnResult, WorkspaceWritePolicy } from "./turn-runner.js";
 import { delegateConfig, issueTicket } from "./ticket-client.js";
 
 // the subset of TurnRunner's public surface these tools call -- a structural interface (rather
 // than importing the TurnRunner class type itself) so src/index.ts's lazy-spawn/respawn wrapper
 // (which is not, and cannot cheaply be, an actual TurnRunner instance) can be passed in too.
 export interface TurnRunnerLike {
-  startThread(options: StartThreadOptions): Promise<{ threadId: string }>;
+  startThread(options: StartThreadOptions): Promise<{ threadId: string; sandbox?: WorkspaceWritePolicy }>;
   ensureThread(threadId: string, settings: ThreadSettings): Promise<void>;
   runTurn(threadId: string, prompt: string, options?: RunTurnOptions): Promise<TurnResult>;
   supportedEfforts(target: { model?: string; threadId?: string }): Promise<SupportedEfforts | undefined>;
@@ -67,6 +69,110 @@ function realPath(path: string): string {
   } catch {
     return resolve(path);
   }
+}
+
+const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
+const inside = (child: string, parent: string): boolean => child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep);
+const sorted = (paths: string[]): string[] => [...new Set(paths)].sort();
+
+function writableRoots(paths: string[], cwd: string): string[] {
+  if (!paths.length) throw new Error("writable-roots must contain at least one directory");
+  const roots = paths.map((path) => {
+    if (!isAbsolute(path)) throw new Error("writable-roots must be absolute paths");
+    if (path.split(sep).includes("..")) throw new Error("writable-roots cannot contain '..'");
+    const hasCodex = (p: string): boolean => p.split(sep).some((part) => part.toLowerCase() === ".codex");
+    if (hasCodex(path)) throw new Error("writable-roots cannot contain a .codex segment");
+    let real: string;
+    try {
+      real = realpathSync(path);
+      if (!statSync(real).isDirectory()) throw new Error();
+    } catch { throw new Error("writable-roots must be an existing directory"); }
+    if (hasCodex(real)) throw new Error("writable-roots cannot contain a .codex segment");
+    if (real === parse(real).root) throw new Error("writable-roots cannot be the filesystem root");
+    if (inside(realPath(homedir()), real)) throw new Error("writable-roots cannot be home or its ancestor");
+    if (inside(cwd, real)) throw new Error("writable-roots cannot be cwd or its ancestor");
+    if (inside(real, cwd)) throw new Error("writable-roots cannot be inside cwd");
+    for (let dir = real; ; dir = dirname(dir)) {
+      const isFile = (name: string): boolean => { try { return statSync(join(dir, name)).isFile(); } catch { return false; } };
+      const isDir = (name: string): boolean => { try { return statSync(join(dir, name)).isDirectory(); } catch { return false; } };
+      if (isFile("commondir") || (isFile("HEAD") && isDir("objects") && isDir("refs"))) {
+        throw new Error("writable-roots cannot be inside a git directory");
+      }
+      if (dirname(dir) === dir) break;
+    }
+    return real;
+  });
+  const result = sorted(roots);
+  if (result.some((root, i) => result.some((other, j) => i !== j && inside(root, other)))) {
+    throw new Error("writable-roots cannot be inside another requested root");
+  }
+  return result;
+}
+
+function gitCommitRoots(cwd: string): { roots: string[]; head: string; gitDir: string } {
+  let lines: string[];
+  try {
+    const args = ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", "--abbrev-ref", "HEAD"];
+    try { lines = execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim().split("\n"); }
+    catch { lines = execFileSync("git", args.filter((arg) => arg !== "--path-format=absolute"), { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim().split("\n"); }
+    if (lines.length !== 3) throw new Error();
+    lines[0] = realpathSync(resolve(cwd, lines[0]));
+    lines[1] = realpathSync(resolve(cwd, lines[1]));
+  } catch { throw new Error("git-commit requires a linked worktree on a codex/* branch"); }
+  const [gitDir, common, branch] = lines;
+  if (gitDir === common || dirname(gitDir) !== join(common, "worktrees")) throw new Error("git-commit requires a linked worktree");
+  if (!branch.startsWith("codex/") || branch.length <= "codex/".length) throw new Error("git-commit requires a codex/* branch");
+  const heads = join(common, "refs", "heads", "codex"), logs = join(common, "logs", "refs", "heads", "codex");
+  mkdirSync(heads, { recursive: true });
+  mkdirSync(logs, { recursive: true });
+  const roots = [join(common, "objects"), heads, logs, gitDir].map((p) => realpathSync(p));
+  if (roots[0] !== join(common, "objects") || roots[1] !== heads || roots[2] !== logs) throw new Error("git-commit metadata paths have changed");
+  return { roots, head: `refs/heads/${branch}`, gitDir };
+}
+
+function snapshotGit(gitDir: string): () => void {
+  const names = ["commondir", "gitdir", "config.worktree"];
+  const snapshot = (name: string): { data: Buffer; mode: number } | undefined => {
+    const path = join(gitDir, name);
+    try {
+      const stat = lstatSync(path);
+      if (!stat.isFile()) throw new Error(`${name} is not a regular file`);
+      return { data: readFileSync(path), mode: stat.mode & 0o777 };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw err;
+    }
+  };
+  const original = names.map(snapshot);
+  return () => {
+    const changed: string[] = [];
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i], path = join(gitDir, name), before = original[i];
+      let after: ReturnType<typeof snapshot>;
+      try { after = snapshot(name); } catch { after = undefined; }
+      if (before && after && before.data.equals(after.data) && before.mode === after.mode) continue;
+      if (!before && !after) {
+        try { lstatSync(path); } catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue; throw err; }
+      }
+      changed.push(name);
+      try {
+        try { unlinkSync(path); } catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+        if (before) writeFileSync(path, before.data, { mode: before.mode, flag: "wx" });
+      } catch (err) { throw new Error(`git-commit could not restore ${name}: ${errorMessage(err)}`); }
+    }
+    let head = "";
+    try { if (lstatSync(join(gitDir, "HEAD")).isFile()) head = readFileSync(join(gitDir, "HEAD"), "utf8").trim(); } catch { /* reported below */ }
+    if (!/^ref: refs\/heads\/codex\/[^\r\n]+$/.test(head)) changed.push("HEAD (not on a codex/* branch)");
+    if (changed.length) throw new Error(`git-commit integrity check failed: ${changed.join(", ")}`);
+  };
+}
+
+function boundExtraRoots(binding: ThreadBinding): string[] {
+  const roots = binding.writableRoots === undefined ? [] : writableRoots(binding.writableRoots, binding.cwd);
+  if (!same(roots, binding.writableRoots ?? [])) throw new Error("writable-roots changed since thread start");
+  const git = binding.gitCommit ? gitCommitRoots(binding.cwd) : undefined;
+  if (git && (!same(git.roots, binding.gitRoots) || git.head !== binding.gitHead)) throw new Error("git-commit roots or branch changed since thread start");
+  return sorted([...roots, ...(git?.roots ?? [])]);
 }
 
 // the checker's decision, or an error: a denied decision, an unreachable checker, and (when the
@@ -266,6 +372,8 @@ const codexInputShape = {
   grant: z.string().optional().describe("Id of a session grant that binds this thread to a project, from `bin/grant issue`."),
   "approval-policy": z.enum(["untrusted", "on-failure", "on-request", "never"]).default("never"),
   sandbox: z.enum(["read-only", "workspace-write", "danger-full-access"]).default("read-only"),
+  "writable-roots": z.array(z.string()).optional().describe("Additional absolute directories writable under workspace-write."),
+  "git-commit": z.boolean().optional().describe("Allow commits in a linked codex/* worktree."),
   config: z.record(z.string(), z.unknown()).optional(),
   "base-instructions": z.string().optional(),
   "developer-instructions": z.string().optional(),
@@ -288,14 +396,25 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
       return { isError: true, content: [{ type: "text", text: CONFIG_UNSUPPORTED_TEXT }] };
     }
 
-    const dispatchId = randomUUID();
-    // a thread without a cwd would run wherever app-server happens to be; bind it to ours
     const cwd = realPath(input.cwd ?? process.cwd());
+    let roots: string[] | undefined;
+    let git: ReturnType<typeof gitCommitRoots> | undefined;
+    try {
+      if ((input["writable-roots"] !== undefined || input["git-commit"] === true) && input.sandbox !== "workspace-write") {
+        throw new Error("writable-roots and git-commit require sandbox workspace-write. Nothing was sent to Codex.");
+      }
+      if (input["writable-roots"] !== undefined) roots = writableRoots(input["writable-roots"], cwd);
+      if (input["git-commit"] === true) git = gitCommitRoots(cwd);
+    } catch (err) {
+      return buildRejectedResult(err, undefined, []);
+    }
+    const addDirs = sorted([...(roots ?? []), ...(git?.roots ?? [])]);
+    const dispatchId = randomUUID();
     const startRequest: GrantRequest = {
       phase: "start",
       harness: "codex",
       cwd,
-      addDirs: [],
+      addDirs,
       grantId: input.grant ?? null,
       revision: null,
       boundProject: null,
@@ -313,7 +432,7 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
       const deadline = Date.now() + 8 * 60 * 60 * 1000;
       const expiry = decision.expiresAt === null ? deadline : Math.min(deadline, Date.parse(decision.expiresAt));
       ticketId = await issueTicket({
-        parent_harness: "codex", dispatch_id: dispatchId, cwd, add_dirs: [], project: decision.project,
+        parent_harness: "codex", dispatch_id: dispatchId, cwd, add_dirs: addDirs, project: decision.project,
         grant_id: startRequest.grantId, revision: decision.grantRevision, effective_hash: decision.effectiveHash,
         expires_at: new Date(expiry).toISOString().replace(/\.\d{3}Z$/, "Z"),
       });
@@ -344,6 +463,16 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
       });
       const startedId = started.threadId;
 
+      let sandboxPolicy: WorkspaceWritePolicy | undefined;
+      if (roots !== undefined || git !== undefined) {
+        const policy = started.sandbox;
+        if (policy?.type !== "workspaceWrite" || (policy.networkAccess !== undefined && typeof policy.networkAccess !== "boolean")) {
+          throw new Error("cannot determine the effective workspace-write sandbox policy; no turn was sent to Codex.");
+        }
+        if (policy.writableRoots !== undefined && (!Array.isArray(policy.writableRoots) || !policy.writableRoots.every((p) => typeof p === "string" && isAbsolute(p)))) throw new Error("invalid effective workspace-write roots");
+        sandboxPolicy = { ...policy, networkAccess: policy.networkAccess ?? false, writableRoots: sorted([...(policy.writableRoots ?? []), ...addDirs]) };
+      }
+
       // saved before the first turn: a thread that cannot be bound is never used, and its id is
       // not handed back either
       const binding: ThreadBinding = {
@@ -357,6 +486,10 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
         effectiveHash: decision.effectiveHash,
         approvalPolicy,
         sandbox: input.sandbox,
+        ...(roots !== undefined ? { writableRoots: roots } : {}),
+        ...(input["git-commit"] !== undefined ? { gitCommit: input["git-commit"] } : {}),
+        ...(git !== undefined ? { gitRoots: git.roots, gitHead: git.head } : {}),
+        ...(sandboxPolicy !== undefined ? { sandboxPolicy } : {}),
         ...(ticketId !== undefined ? { ticketId } : {}),
         ...(input.model !== undefined ? { model: input.model } : {}),
         createdAt: new Date().toISOString(),
@@ -376,6 +509,7 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
 
       // model went on thread/start above; effort has no thread/start field, so it rides on the
       // first turn/start, where app-server makes it sticky for the rest of the thread.
+      let checkIntegrity: (() => void) | undefined;
       const turnResult = await runTurnWithProgress(
         turnRunner,
         threadId,
@@ -383,23 +517,28 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
         {
           timeoutMs: input["timeout-seconds"] * 1000,
           effort: input.effort,
+          sandboxPolicy,
           // once the turn has its place in the queue, a resume check on the binding just saved:
           // its project, grant and revision, and the same fingerprint
           beforeStart: async () => {
+            const checkedRoots = boundExtraRoots(binding);
             await allowedDecision(
               deps,
               {
                 phase: "resume",
                 harness: "codex",
                 cwd,
-                addDirs: [],
+                addDirs: checkedRoots,
                 grantId: binding.grantId,
                 revision: binding.grantRevision,
                 boundProject: binding.project,
               },
               binding.effectiveHash,
             );
+            boundExtraRoots(binding);
+            if (binding.gitCommit) checkIntegrity = snapshotGit(binding.gitRoots![3]);
           },
+          afterFinish: async () => { checkIntegrity?.(); },
         },
         extra,
       );
@@ -432,6 +571,8 @@ const codexReplyInputSchema = z
       .string()
       .optional()
       .describe("Optional. Must be the directory the thread was started in; a different one is refused."),
+    "writable-roots": z.array(z.string()).optional().describe("Optional. Must match the roots bound to the thread."),
+    "git-commit": z.boolean().optional().describe("Optional. Must match the thread binding."),
     model: z
       .string()
       .optional()
@@ -476,11 +617,19 @@ export function createCodexReplyTool(turnRunner: TurnRunnerLike, deps: BindingDe
       if (input.cwd !== undefined && realPath(input.cwd) !== bound.cwd) {
         throw new Error("cwd differs from the directory this thread was started in. Nothing was sent to Codex.");
       }
+      if (input["writable-roots"] !== undefined &&
+          !same(writableRoots(input["writable-roots"], bound.cwd), bound.writableRoots)) {
+        throw new Error("writable-roots differ from the roots this thread was started with. Nothing was sent to Codex.");
+      }
+      if (input["git-commit"] !== undefined && input["git-commit"] !== bound.gitCommit) {
+        throw new Error("git-commit differs from the setting this thread was started with. Nothing was sent to Codex.");
+      }
+      const addDirs = boundExtraRoots(bound);
       const resumeRequest: GrantRequest = {
         phase: "resume",
         harness: "codex",
         cwd: bound.cwd,
-        addDirs: [],
+        addDirs,
         grantId: bound.grantId,
         revision: bound.grantRevision,
         boundProject: bound.project,
@@ -496,6 +645,7 @@ export function createCodexReplyTool(turnRunner: TurnRunnerLike, deps: BindingDe
       });
       const invalidEffort = await effortError(turnRunner, input.effort, { model: input.model, threadId });
       if (invalidEffort !== undefined) return buildRejectedResult(new Error(invalidEffort), threadId, []);
+      let checkIntegrity: (() => void) | undefined;
       const turnResult = await runTurnWithProgress(
         turnRunner,
         threadId,
@@ -504,15 +654,20 @@ export function createCodexReplyTool(turnRunner: TurnRunnerLike, deps: BindingDe
           timeoutMs: input["timeout-seconds"] * 1000,
           model: input.model,
           effort: input.effort,
+          sandboxPolicy: bound.sandboxPolicy,
           // under the thread's lock: the check again after any queue wait, then the model switch
           // is recorded, so a restart resumes on the model the thread last used
           beforeStart: async () => {
-            await allowedDecision(deps, resumeRequest, bound.effectiveHash);
+            const checkedRoots = boundExtraRoots(bound);
+            await allowedDecision(deps, { ...resumeRequest, addDirs: checkedRoots }, bound.effectiveHash);
+            boundExtraRoots(bound);
+            if (bound.gitCommit) checkIntegrity = snapshotGit(bound.gitRoots![3]);
             if (input.model === undefined) return;
             const fresh = await deps.bindings.load(threadId);
             if (!fresh) throw new Error(NO_BINDING_TEXT);
             if (fresh.model !== input.model) await deps.bindings.save({ ...fresh, model: input.model });
           },
+          afterFinish: async () => { checkIntegrity?.(); },
         },
         extra,
       );

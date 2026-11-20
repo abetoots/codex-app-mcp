@@ -6,7 +6,7 @@
 // `send()`/`sendServerRequest()` write json-rpc lines to stdout. each scenario is
 // just an async function built from those primitives, registered in `scenarios`
 // below -- task 5 can add more scenarios without touching this plumbing.
-import { appendFileSync, existsSync } from "node:fs";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import readline from "node:readline";
 
 const scenario = process.env.FAKE_SCENARIO;
@@ -469,7 +469,7 @@ const scenarios = {
       appendFileSync(process.env.FAKE_LOG, `${JSON.stringify({ method: msg.method, params: msg.params })}\n`);
       if (msg.method === "thread/start") {
         threads += 1;
-        replyResult(msg, { thread: { id: `t${threads}` } });
+        replyResult(msg, { thread: { id: `t${threads}` }, ...(process.env.FAKE_NO_SANDBOX ? {} : { sandbox: { type: process.env.FAKE_SANDBOX_TYPE ?? "workspaceWrite", networkAccess: process.env.FAKE_NETWORK !== "false", excludeSlashTmp: true, excludeTmpdirEnvVar: false, writableRoots: process.env.FAKE_CONFIGURED_ROOT ? [process.env.FAKE_CONFIGURED_ROOT] : [] } }) });
       } else if (msg.method === "thread/resume") {
         replyResult(msg, { thread: { id: msg.params.threadId } });
       } else if (msg.method === "thread/read") {
@@ -495,9 +495,11 @@ const scenarios = {
         const prompt = msg.params.input[0].text;
         replyResult(msg, { turn: { id: turnId } });
         send({ method: "turn/started", params: threadStartedItem(threadId, turnId) });
+        if (process.env.FAKE_TAMPER_PATH) writeFileSync(process.env.FAKE_TAMPER_PATH, "tampered\n");
         if (prompt.startsWith("slow")) await sleep(500);
         while (prompt.startsWith("hold") && !existsSync(`${process.env.FAKE_LOG}.release`)) await sleep(20);
-        await finishTurn(threadId, turnId, [{ phase: "final_answer", text: prompt }]);
+        if (process.env.FAKE_FAIL_TURN) send({ method: "turn/completed", params: { threadId, turn: { id: turnId, status: "failed", error: { message: "simulated failure" } } } });
+        else await finishTurn(threadId, turnId, [{ phase: "final_answer", text: prompt }]);
       }
     }
   },

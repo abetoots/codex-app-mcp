@@ -54,6 +54,8 @@ existing skills/tooling that call `mcp__codex__codex` /
 | `grant` | string | — | optional session grant id, checked with the hub's grant checker |
 | `approval-policy` | `untrusted \| on-failure \| on-request \| never` | `never` | `on-failure` maps to `on-request` — app-server dropped that value |
 | `sandbox` | `read-only \| workspace-write \| danger-full-access` | `read-only` | |
+| `writable-roots` | array of absolute directory paths | — | extra writable ordinary directories; requires `workspace-write` |
+| `git-commit` | boolean | `false` | grant commit access to a linked `codex/*` worktree; requires `workspace-write` |
 | `config` | — | — | refused when present: a thread gets MCP servers only from the project's files |
 | `base-instructions` | string | — | optional |
 | `developer-instructions` | string | — | optional |
@@ -69,6 +71,8 @@ existing skills/tooling that call `mcp__codex__codex` /
 | `conversationId` | string | — | deprecated alias for `threadId` |
 | `prompt` | string | — | required |
 | `cwd` | string | bound cwd | optional; refused unless it is the directory the thread was started in |
+| `writable-roots` | array of absolute directory paths | bound roots | optional; refused unless it matches the roots used at thread start |
+| `git-commit` | boolean | bound setting | optional; refused unless it matches the setting used at thread start |
 | `model` | string | thread's current | switches the thread from this turn on |
 | `effort` | string | thread's current | switches the thread from this turn on |
 | `timeout-seconds` | number | `900` | |
@@ -81,11 +85,35 @@ requested effort against the model's advertised list and refuses it, without
 sending anything, if it isn't there. Codex itself would store an invalid value
 and fail every later turn on that thread.
 
+`writable-roots` must be a nonempty list of existing absolute directories without
+`..`. Roots are canonicalized, sorted, and deduplicated. The filesystem root,
+home and its ancestors, cwd and its ancestors, directories inside cwd, nested
+requested roots, `.codex` paths (case insensitive), and Git metadata directories
+are refused. Git directories are detected by their structure, including bare
+repositories and separate Git directories. Nested repositories below a granted
+folder are not protected. Roots are checked again before each turn, and must be
+allowed by the grant checker.
+
+To enable commits, start in a linked worktree on a `codex/<task>` branch and pass
+`sandbox: "workspace-write"` with `git-commit: true`. The bridge derives the
+common Git directory's `objects`, `refs/heads/codex`, and `logs/refs/heads/codex`
+directories, plus that worktree's own administrative directory. The two `codex`
+ref directories are created if necessary. The bridge checks and restores changes
+to the worktree's `commondir`, `gitdir`, and `config.worktree` after each turn,
+and reports a HEAD that no longer points to a `codex/*` branch. Git may warn
+that it cannot create `packed-refs.lock` even when a commit succeeds.
+
+The `objects` root allows a child to delete or rewrite Git objects. The remote is
+the backup; use `git-commit` only on trusted threads. Both options can be used
+together. The effective roots, network access, and temporary-directory settings
+from `thread/start` are preserved and combined with the extra roots for every
+turn. Replies can omit either option or repeat its original value.
+
 ### Thread bindings
 
 `codex` asks the grant checker (`AI_GRANT_CHECK`, default
 `$HOME/ai-cli-sync/bin/grant-check`) before it starts a thread, then records the
-thread's cwd, project, grant, standing-scope hash, approval policy, sandbox and
+thread's cwd, project, grant, standing-scope hash, approval policy, sandbox, writable roots, commit setting and
 model in `CODEX_MCP_STATE_DIR` (default `~/.local/state/codex-app-mcp/bindings`;
 directory 0700, files 0600). `codex-reply` takes all of these from the binding,
 never from the caller: a thread with no readable binding is refused, the grant

@@ -29,7 +29,7 @@ process.stdin.on("end", () => {
     process.stdout.write(fixture.rawStdout);
     process.exit(0);
   }
-  const decision = fixture.sequence?.[n] ?? fixture.byPhase?.[request.phase] ?? fixture.decision;
+  const decision = fixture.denyAddDirs && request.add_dirs.length ? { ...fixture.decision, allowed: false, reason: "outside-dir-denied" } : fixture.sequence?.[n] ?? fixture.byPhase?.[request.phase] ?? fixture.decision;
   process.stdout.write(`${JSON.stringify(decision)}\n`);
   process.exit(fixture.exitWith ?? (decision.allowed ? 0 : 2));
 });

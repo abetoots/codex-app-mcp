@@ -28,10 +28,20 @@ export interface RunTurnOptions {
   // never sent as null, which would not mean "unchanged".
   model?: string;
   effort?: string;
+  sandboxPolicy?: WorkspaceWritePolicy;
   // awaited once this turn has its place in the thread's queue and before turn/start is sent,
   // so a check made before the wait can be made again after it. a throw ends the call without
   // sending turn/start.
   beforeStart?: () => Promise<void>;
+  afterFinish?: () => Promise<void>;
+}
+
+export interface WorkspaceWritePolicy {
+  type: "workspaceWrite";
+  writableRoots: string[];
+  networkAccess: boolean;
+  excludeSlashTmp?: boolean;
+  excludeTmpdirEnvVar?: boolean;
 }
 
 export interface TurnResult {
@@ -155,8 +165,8 @@ export class TurnRunner {
     this.client.onServerRequest((method, params) => this.handleServerRequest(method, params));
   }
 
-  async startThread(options: StartThreadOptions): Promise<{ threadId: string }> {
-    const result = await this.client.request<{ thread: { id: string } }>(CLIENT_REQUESTS.threadStart, {
+  async startThread(options: StartThreadOptions): Promise<{ threadId: string; sandbox?: WorkspaceWritePolicy }> {
+    const result = await this.client.request<{ thread: { id: string }; sandbox?: WorkspaceWritePolicy }>(CLIENT_REQUESTS.threadStart, {
       cwd: options.cwd,
       approvalPolicy: options.approvalPolicy,
       sandbox: options.sandbox,
@@ -167,7 +177,7 @@ export class TurnRunner {
     });
     const threadId = result.thread.id;
     this.knownThreadIds.add(threadId);
-    return { threadId };
+    return { threadId, sandbox: result.sandbox };
   }
 
   // the reasoning efforts a model advertises, for validating an effort before it's sent. codex
@@ -253,10 +263,12 @@ export class TurnRunner {
   // independent and may run at the same time.
   runTurn(threadId: string, prompt: string, options: RunTurnOptions = {}): Promise<TurnResult> {
     const previous = this.threadLocks.get(threadId) ?? Promise.resolve();
-    const run = previous.then(
-      () => this.runTurnOnce(threadId, prompt, options),
-      () => this.runTurnOnce(threadId, prompt, options),
-    );
+    const execute = async (): Promise<TurnResult> => {
+      await options.beforeStart?.();
+      try { return await this.runTurnOnce(threadId, prompt, options); }
+      finally { await options.afterFinish?.(); }
+    };
+    const run = previous.then(execute, execute);
     // never let a rejection here block the next queued turn; the rejection itself still
     // propagates to whoever is awaiting the `run` promise this method returns.
     this.threadLocks.set(
@@ -270,7 +282,6 @@ export class TurnRunner {
   }
 
   private async runTurnOnce(threadId: string, prompt: string, options: RunTurnOptions): Promise<TurnResult> {
-    await options.beforeStart?.();
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const declinedRequests: string[] = [];
     this.activeDeclines.set(threadId, declinedRequests);
@@ -363,6 +374,7 @@ export class TurnRunner {
           {
             threadId,
             input: [{ type: "text", text: prompt }],
+            ...(options.sandboxPolicy !== undefined ? { sandboxPolicy: options.sandboxPolicy } : {}),
             ...(options.model !== undefined ? { model: options.model } : {}),
             ...(options.effort !== undefined ? { effort: options.effort } : {}),
           },

@@ -3,10 +3,10 @@
 // grant checker (tests/fake-grant-check.mjs). "restart" means a brand new AppServerClient,
 // TurnRunner and tool objects over the same on-disk store; the one test that kills a real
 // server process spawns the built dist/index.js.
-import { copyFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
-import { tmpdir } from "node:os";
+import { execFileSync, spawnSync } from "node:child_process";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -443,6 +443,200 @@ describe("GrantClient contract", () => {
 });
 
 describe("codex thread binding", () => {
+  it("sorts and deduplicates roots, keeps configured roots and checks grants on start and resume", async () => {
+    const env = makeEnv();
+    const a = join(env.dir, "a"), b = join(env.dir, "b");
+    mkdirSync(a); mkdirSync(b);
+    vi.stubEnv("FAKE_CONFIGURED_ROOT", "/configured/root");
+    const { codex } = await boot(env);
+    const result = await codex.handler({ ...codexInput, cwd: env.cwd, sandbox: "workspace-write", "writable-roots": [b, a, a] }, extra);
+    expect(result.isError).toBeFalsy();
+    expect((await env.store.load("t1"))?.writableRoots).toEqual([a, b]);
+    const { reply } = await boot(env);
+    expect((await reply.handler({ ...replyInput, threadId: "t1", "writable-roots": [a, b] }, extra)).isError).toBeFalsy();
+    expect(calls(env, "turn/start")).toHaveLength(2);
+    for (const turn of calls(env, "turn/start")) {
+      expect(turn.params.sandboxPolicy).toEqual({ type: "workspaceWrite", networkAccess: true, excludeSlashTmp: true, excludeTmpdirEnvVar: false, writableRoots: expect.arrayContaining(["/configured/root", a, b]) });
+    }
+    expect(lines(env.requestsLog).map((r) => [r.phase, r.add_dirs])).toEqual([["start", [a, b]], ["resume", [a, b]], ["resume", [a, b]], ["resume", [a, b]]]);
+  });
+
+  it("refuses extra roots denied by the grant checker before starting", async () => {
+    const env = makeEnv({ decision: wireDecision(), denyAddDirs: true });
+    const root = join(env.dir, "outside"); mkdirSync(root);
+    const { codex } = await boot(env);
+    const result = await codex.handler({ ...codexInput, cwd: env.cwd, sandbox: "workspace-write", "writable-roots": [root] }, extra);
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toMatch(/outside-dir-denied/);
+    expect(lines(env.requestsLog)[0].add_dirs).toEqual([root]);
+    expect(calls(env, "thread/start")).toHaveLength(0);
+  });
+
+  it("refuses unsafe ordinary roots with specific reasons before starting", async () => {
+    const env = makeEnv();
+    const file = join(env.dir, "file"); writeFileSync(file, "x");
+    const nested = join(env.cwd, "nested"); mkdirSync(nested);
+    const codexDir = join(env.dir, ".CODEX"); mkdirSync(codexDir);
+    const alias = join(env.dir, "alias"); symlinkSync(codexDir, alias);
+    const a = join(env.dir, "a"); mkdirSync(join(a, "child"), { recursive: true });
+    const git = join(env.dir, "proj.git"); execFileSync("git", ["init", "--bare", git]);
+    const separate = join(env.dir, "git-metadata"), checkout = join(env.dir, "separate-checkout");
+    execFileSync("git", ["init", "--separate-git-dir", separate, checkout]);
+    const { codex } = await boot(env);
+    const invalid: Array<[string[], RegExp]> = [
+      [[], /at least one/i], [["relative"], /absolute/i], [[`${env.dir}/../x`], /\.\./],
+      [[join(env.dir, "missing")], /existing directory/i], [[file], /existing directory/i],
+      [["/"], /root|ancestor/i], [[homedir()], /home|ancestor/i], [["/home"], /home|ancestor/i],
+      [[env.dir], /cwd|ancestor/i], [[nested], /inside cwd/i], [[codexDir], /\.codex/i], [[alias], /\.codex/i],
+      [[git], /git directory/i], [[join(git, "hooks")], /git directory/i], [[separate], /git directory/i],
+      [[a, join(a, "child")], /nested|inside another/i],
+    ];
+    for (const [roots, message] of invalid) {
+      const result = await codex.handler({ ...codexInput, cwd: env.cwd, sandbox: "workspace-write", "writable-roots": roots }, extra);
+      expect(result.isError, JSON.stringify(roots)).toBe(true);
+      expect(textOf(result), JSON.stringify(roots)).toMatch(message);
+    }
+    for (const sandbox of ["read-only", "danger-full-access"] as const) {
+      for (const option of [{ "writable-roots": [a] }, { "git-commit": true }]) {
+        const result = await codex.handler({ ...codexInput, cwd: env.cwd, sandbox, ...option }, extra);
+        expect(result.isError).toBe(true); expect(textOf(result)).toMatch(/require.*workspace-write/i);
+      }
+    }
+    expect(calls(env, "thread/start")).toHaveLength(0);
+  });
+
+  it("refuses changed options and retargeted roots after restart", async () => {
+    const env = makeEnv();
+    const root = join(env.dir, "outside"), other = join(env.dir, "other"); mkdirSync(root); mkdirSync(other);
+    const { codex } = await boot(env);
+    expect((await codex.handler({ ...codexInput, cwd: env.cwd, sandbox: "workspace-write", "writable-roots": [root] }, extra)).isError).toBeFalsy();
+    const { reply } = await boot(env);
+    const changed = await reply.handler({ ...replyInput, threadId: "t1", "writable-roots": [other] }, extra);
+    expect(textOf(changed)).toMatch(/writable-roots differ/i);
+    const added = await reply.handler({ ...replyInput, threadId: "t1", "git-commit": true }, extra);
+    expect(textOf(added)).toMatch(/git-commit differs/i);
+    const moved = join(env.dir, "moved");
+    const { renameSync } = await import("node:fs"); renameSync(root, moved); symlinkSync(other, root);
+    const swapped = await reply.handler({ ...replyInput, threadId: "t1" }, extra);
+    expect(swapped.isError).toBe(true); expect(textOf(swapped)).toMatch(/writable.roots.*changed/i);
+    expect(calls(env, "turn/start")).toHaveLength(1);
+  });
+
+  it("keeps network disabled and refuses missing effective policy", async () => {
+    vi.stubEnv("FAKE_NETWORK", "false");
+    const env = makeEnv(), root = join(env.dir, "outside"); mkdirSync(root);
+    const { codex, reply } = await boot(env);
+    expect((await codex.handler({ ...codexInput, cwd: env.cwd, sandbox: "workspace-write", "writable-roots": [root] }, extra)).isError).toBeFalsy();
+    expect((await reply.handler({ ...replyInput, threadId: "t1" }, extra)).isError).toBeFalsy();
+    expect(calls(env, "turn/start").every((c) => c.params.sandboxPolicy.networkAccess === false)).toBe(true);
+    vi.stubEnv("FAKE_NO_SANDBOX", "1");
+    const other = makeEnv(), outside = join(other.dir, "outside"); mkdirSync(outside);
+    const result = await (await boot(other)).codex.handler({ ...codexInput, cwd: other.cwd, sandbox: "workspace-write", "writable-roots": [outside] }, extra);
+    expect(textOf(result)).toMatch(/effective workspace-write sandbox policy/);
+    expect(calls(other, "turn/start")).toHaveLength(0);
+  });
+
+  it.each(["read-only", "workspace-write", "danger-full-access"] as const)("does not change no-option %s threads on reply", async (sandbox) => {
+    const env = makeEnv(), root = join(env.dir, "outside"); mkdirSync(root);
+    const { codex, reply } = await boot(env);
+    expect((await codex.handler({ ...codexInput, cwd: env.cwd, sandbox }, extra)).isError).toBeFalsy();
+    expect((await reply.handler({ ...replyInput, threadId: "t1" }, extra)).isError).toBeFalsy();
+    expect(textOf(await reply.handler({ ...replyInput, threadId: "t1", "writable-roots": [root] }, extra))).toMatch(/writable-roots differ/i);
+    expect(textOf(await reply.handler({ ...replyInput, threadId: "t1", "git-commit": true }, extra))).toMatch(/git-commit differs/i);
+    expect(calls(env, "turn/start")).toHaveLength(2);
+    expect(calls(env, "turn/start").every((call) => !("sandboxPolicy" in call.params))).toBe(true);
+  });
+
+  it("allows an explicit false commit option to be repeated without granting metadata", async () => {
+    const env = makeEnv();
+    const { codex, reply } = await boot(env);
+    expect((await codex.handler({ ...codexInput, cwd: env.cwd, "git-commit": false }, extra)).isError).toBeFalsy();
+    expect((await reply.handler({ ...replyInput, threadId: "t1", "git-commit": false }, extra)).isError).toBeFalsy();
+    expect(calls(env, "turn/start").every((call) => !("sandboxPolicy" in call.params))).toBe(true);
+  });
+
+  it("refuses a non-workspace effective policy before sending a turn", async () => {
+    vi.stubEnv("FAKE_SANDBOX_TYPE", "readOnly");
+    const env = makeEnv(), root = join(env.dir, "outside"); mkdirSync(root);
+    const result = await (await boot(env)).codex.handler({ ...codexInput, cwd: env.cwd, sandbox: "workspace-write", "writable-roots": [root] }, extra);
+    expect(result.isError).toBe(true); expect(textOf(result)).toMatch(/effective workspace-write sandbox policy/);
+    expect(calls(env, "thread/start")).toHaveLength(1); expect(calls(env, "turn/start")).toHaveLength(0);
+  });
+
+  it("derives worktree roots, checks grants and rejects switched branches", async () => {
+    const env = makeEnv();
+    execFileSync("git", ["init", "-b", "main", env.cwd]);
+    execFileSync("git", ["-C", env.cwd, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "initial"]);
+    const worktree = join(env.dir, "worktree");
+    execFileSync("git", ["-C", env.cwd, "worktree", "add", "-b", "codex/t1", worktree]);
+    const gitDir = execFileSync("git", ["-C", worktree, "rev-parse", "--absolute-git-dir"], { encoding: "utf8" }).trim();
+    const common = join(env.cwd, ".git");
+    const roots = [join(common, "objects"), join(common, "refs/heads/codex"), join(common, "logs/refs/heads/codex"), gitDir];
+    const outside = join(env.dir, "outside"); mkdirSync(outside);
+    const { codex, reply } = await boot(env);
+    const result = await codex.handler({ ...codexInput, cwd: worktree, sandbox: "workspace-write", "git-commit": true, "writable-roots": [outside] }, extra);
+    expect(result.isError, textOf(result)).toBeFalsy();
+    const expected = [...roots, outside].sort();
+    expect(calls(env, "turn/start")[0].params.sandboxPolicy.writableRoots).toEqual(expected);
+    expect((await reply.handler({ ...replyInput, threadId: "t1", "git-commit": true }, extra)).isError).toBeFalsy();
+    expect(lines(env.requestsLog).every((r) => JSON.stringify(r.add_dirs) === JSON.stringify(expected))).toBe(true);
+    execFileSync("git", ["-C", worktree, "switch", "-c", "codex/t2"]);
+    const changed = await reply.handler({ ...replyInput, threadId: "t1" }, extra);
+    expect(textOf(changed)).toMatch(/branch changed/i);
+    execFileSync("git", ["-C", worktree, "switch", "--detach"]);
+    const switched = await reply.handler({ ...replyInput, threadId: "t1" }, extra);
+    expect(switched.isError).toBe(true); expect(textOf(switched)).toMatch(/codex\//i);
+    expect(calls(env, "turn/start")).toHaveLength(2);
+    const main = await codex.handler({ ...codexInput, cwd: env.cwd, sandbox: "workspace-write", "git-commit": true }, extra);
+    expect(main.isError).toBe(true); expect(textOf(main)).toMatch(/linked worktree/i);
+    const wrongBranch = await codex.handler({ ...codexInput, cwd: worktree, sandbox: "workspace-write", "git-commit": true }, extra);
+    expect(wrongBranch.isError).toBe(true); expect(textOf(wrongBranch)).toMatch(/codex\//i);
+  });
+
+  it("restores a tampered worktree commondir and returns an error", async () => {
+    const env = makeEnv();
+    execFileSync("git", ["init", "-b", "main", env.cwd]);
+    execFileSync("git", ["-C", env.cwd, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "initial"]);
+    const worktree = join(env.dir, "worktree"); execFileSync("git", ["-C", env.cwd, "worktree", "add", "-b", "codex/t1", worktree]);
+    const gitDir = execFileSync("git", ["-C", worktree, "rev-parse", "--absolute-git-dir"], { encoding: "utf8" }).trim();
+    const file = join(gitDir, "commondir"), original = readFileSync(file, "utf8");
+    vi.stubEnv("FAKE_TAMPER_PATH", file);
+    const result = await (await boot(env)).codex.handler({ ...codexInput, cwd: worktree, sandbox: "workspace-write", "git-commit": true }, extra);
+    expect(result.isError).toBe(true); expect(textOf(result)).toMatch(/commondir/i);
+    expect(readFileSync(file, "utf8")).toBe(original);
+  });
+
+  it("revalidates roots after waiting in the thread queue", async () => {
+    const env = makeEnv(), root = join(env.dir, "outside"), other = join(env.dir, "other"); mkdirSync(root); mkdirSync(other);
+    const { codex, reply } = await boot(env);
+    expect((await codex.handler({ ...codexInput, cwd: env.cwd, sandbox: "workspace-write", "writable-roots": [root] }, extra)).isError).toBeFalsy();
+    const first = reply.handler({ ...replyInput, threadId: "t1", prompt: "hold" }, extra);
+    await waitFor(() => calls(env, "turn/start").length === 2, "holding turn");
+    const second = reply.handler({ ...replyInput, threadId: "t1" }, extra);
+    await waitFor(() => lines(env.requestsLog).length >= 5, "queued grant check");
+    const { renameSync } = await import("node:fs"); renameSync(root, join(env.dir, "old")); symlinkSync(other, root);
+    writeFileSync(`${env.logFile}.release`, "go");
+    expect((await first).isError).toBeFalsy();
+    const result = await second;
+    expect(result.isError).toBe(true); expect(textOf(result)).toMatch(/writable.roots.*changed/i);
+    expect(calls(env, "turn/start")).toHaveLength(2);
+  });
+
+  it.each(["commondir", "gitdir", "config.worktree", "HEAD"])("guards %s after a failed turn", async (name) => {
+    const env = makeEnv();
+    execFileSync("git", ["init", "-b", "main", env.cwd]);
+    execFileSync("git", ["-C", env.cwd, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "initial"]);
+    const worktree = join(env.dir, "worktree"); execFileSync("git", ["-C", env.cwd, "worktree", "add", "-b", "codex/t1", worktree]);
+    const gitDir = execFileSync("git", ["-C", worktree, "rev-parse", "--absolute-git-dir"], { encoding: "utf8" }).trim();
+    const file = join(gitDir, name), original = existsSync(file) ? readFileSync(file, "utf8") : undefined;
+    vi.stubEnv("FAKE_TAMPER_PATH", file); vi.stubEnv("FAKE_FAIL_TURN", "1");
+    const result = await (await boot(env)).codex.handler({ ...codexInput, cwd: worktree, sandbox: "workspace-write", "git-commit": true }, extra);
+    expect(result.isError).toBe(true); expect(textOf(result)).toContain(name);
+    if (name === "HEAD") expect(readFileSync(file, "utf8")).toBe("tampered\n");
+    else if (original === undefined) expect(existsSync(file)).toBe(false);
+    else expect(readFileSync(file, "utf8")).toBe(original);
+  });
+
   it("codex outside any project without a grant works and stores a binding", async () => {
     const env = makeEnv({ decision: wireDecision({ reason: "no-project", project: null, effective_hash: "h0" }) });
     const { codex } = await boot(env);

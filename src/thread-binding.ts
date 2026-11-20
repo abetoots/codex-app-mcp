@@ -6,7 +6,7 @@ import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
-import type { ThreadSettings } from "./turn-runner.js";
+import type { ThreadSettings, WorkspaceWritePolicy } from "./turn-runner.js";
 
 export interface ThreadBinding {
   schema: 1;
@@ -19,6 +19,11 @@ export interface ThreadBinding {
   effectiveHash: string;
   approvalPolicy: ThreadSettings["approvalPolicy"];
   sandbox: ThreadSettings["sandbox"];
+  writableRoots?: string[];
+  gitCommit?: boolean;
+  gitRoots?: string[];
+  gitHead?: string;
+  sandboxPolicy?: WorkspaceWritePolicy;
   model?: string;
   ticketId?: string;
   createdAt: string;
@@ -59,6 +64,20 @@ function validate(threadId: string, value: unknown): ThreadBinding {
     typeof b.effectiveHash === "string" &&
     APPROVAL_POLICIES.includes(b.approvalPolicy) &&
     SANDBOXES.includes(b.sandbox) &&
+    ((b.writableRoots === undefined && (b.gitCommit === undefined || b.gitCommit === false) && b.gitRoots === undefined && b.gitHead === undefined && b.sandboxPolicy === undefined) ||
+      (b.sandbox === "workspace-write" &&
+        (b.writableRoots === undefined || (Array.isArray(b.writableRoots) && b.writableRoots.length > 0 && b.writableRoots.every((p) => typeof p === "string" && isAbsolute(p)))) &&
+        (((b.gitCommit === undefined || b.gitCommit === false) && b.gitRoots === undefined && b.gitHead === undefined) ||
+          (b.gitCommit === true && Array.isArray(b.gitRoots) && b.gitRoots.length === 4 && b.gitRoots.every((p) => typeof p === "string" && isAbsolute(p)) && typeof b.gitHead === "string" && b.gitHead.startsWith("refs/heads/codex/"))) &&
+        (b.writableRoots !== undefined || b.gitCommit === true) &&
+        typeof b.sandboxPolicy === "object" && b.sandboxPolicy !== null &&
+        (b.sandboxPolicy as WorkspaceWritePolicy).type === "workspaceWrite" &&
+        typeof (b.sandboxPolicy as WorkspaceWritePolicy).networkAccess === "boolean" &&
+        Array.isArray((b.sandboxPolicy as WorkspaceWritePolicy).writableRoots) &&
+        (b.sandboxPolicy as WorkspaceWritePolicy).writableRoots.every((p) => typeof p === "string" && isAbsolute(p)) &&
+        [...(b.writableRoots as string[] | undefined ?? []), ...(b.gitRoots as string[] | undefined ?? [])].every((p) => (b.sandboxPolicy as WorkspaceWritePolicy).writableRoots.includes(p)) &&
+        [undefined, true, false].includes((b.sandboxPolicy as WorkspaceWritePolicy).excludeSlashTmp) &&
+        [undefined, true, false].includes((b.sandboxPolicy as WorkspaceWritePolicy).excludeTmpdirEnvVar))) &&
     (b.model === undefined || typeof b.model === "string") &&
     (b.ticketId === undefined || (typeof b.ticketId === "string" && /^[0-9a-f]{32}$/.test(b.ticketId))) &&
     typeof b.createdAt === "string";
