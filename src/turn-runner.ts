@@ -33,7 +33,6 @@ export interface RunTurnOptions {
   // so a check made before the wait can be made again after it. a throw ends the call without
   // sending turn/start.
   beforeStart?: () => Promise<void>;
-  afterFinish?: () => Promise<void>;
 }
 
 export interface WorkspaceWritePolicy {
@@ -263,12 +262,10 @@ export class TurnRunner {
   // independent and may run at the same time.
   runTurn(threadId: string, prompt: string, options: RunTurnOptions = {}): Promise<TurnResult> {
     const previous = this.threadLocks.get(threadId) ?? Promise.resolve();
-    const execute = async (): Promise<TurnResult> => {
-      await options.beforeStart?.();
-      try { return await this.runTurnOnce(threadId, prompt, options); }
-      finally { await options.afterFinish?.(); }
-    };
-    const run = previous.then(execute, execute);
+    const run = previous.then(
+      () => this.runTurnOnce(threadId, prompt, options),
+      () => this.runTurnOnce(threadId, prompt, options),
+    );
     // never let a rejection here block the next queued turn; the rejection itself still
     // propagates to whoever is awaiting the `run` promise this method returns.
     this.threadLocks.set(
@@ -282,6 +279,7 @@ export class TurnRunner {
   }
 
   private async runTurnOnce(threadId: string, prompt: string, options: RunTurnOptions): Promise<TurnResult> {
+    await options.beforeStart?.();
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const declinedRequests: string[] = [];
     this.activeDeclines.set(threadId, declinedRequests);

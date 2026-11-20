@@ -71,7 +71,7 @@ export function defaultCheckerPath(env: NodeJS.ProcessEnv = process.env): string
 const CHECK_TIMEOUT_MS = 10_000;
 
 export class GrantClient {
-  constructor(private readonly checkerPath: string) {}
+  constructor(readonly checkerPath: string) {}
 
   // exit 0 and 2 carry a decision; anything else -- a missing checker, exit 3 (unreadable
   // registry), a timeout, bad output -- rejects, so callers fail closed. a decision is allowed

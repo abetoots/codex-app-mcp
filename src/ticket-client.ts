@@ -2,8 +2,12 @@ import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+export function ticketHelperPath(): string {
+  return process.env.AI_DELEGATION_TICKET_HELPER ?? join(homedir(), "ai-cli-sync", "bin", "delegation-ticket");
+}
+
 export function issueTicket(request: Record<string, unknown>): Promise<string> {
-  const helper = process.env.AI_DELEGATION_TICKET_HELPER ?? join(homedir(), "ai-cli-sync", "bin", "delegation-ticket");
+  const helper = ticketHelperPath();
   return new Promise((resolve, reject) => {
     const child = spawn(helper, ["issue"], { stdio: ["pipe", "pipe", "ignore"] });
     let output = "";

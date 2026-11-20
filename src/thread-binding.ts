@@ -20,9 +20,6 @@ export interface ThreadBinding {
   approvalPolicy: ThreadSettings["approvalPolicy"];
   sandbox: ThreadSettings["sandbox"];
   writableRoots?: string[];
-  gitCommit?: boolean;
-  gitRoots?: string[];
-  gitHead?: string;
   sandboxPolicy?: WorkspaceWritePolicy;
   model?: string;
   ticketId?: string;
@@ -64,18 +61,15 @@ function validate(threadId: string, value: unknown): ThreadBinding {
     typeof b.effectiveHash === "string" &&
     APPROVAL_POLICIES.includes(b.approvalPolicy) &&
     SANDBOXES.includes(b.sandbox) &&
-    ((b.writableRoots === undefined && (b.gitCommit === undefined || b.gitCommit === false) && b.gitRoots === undefined && b.gitHead === undefined && b.sandboxPolicy === undefined) ||
-      (b.sandbox === "workspace-write" &&
-        (b.writableRoots === undefined || (Array.isArray(b.writableRoots) && b.writableRoots.length > 0 && b.writableRoots.every((p) => typeof p === "string" && isAbsolute(p)))) &&
-        (((b.gitCommit === undefined || b.gitCommit === false) && b.gitRoots === undefined && b.gitHead === undefined) ||
-          (b.gitCommit === true && Array.isArray(b.gitRoots) && b.gitRoots.length === 4 && b.gitRoots.every((p) => typeof p === "string" && isAbsolute(p)) && typeof b.gitHead === "string" && b.gitHead.startsWith("refs/heads/codex/"))) &&
-        (b.writableRoots !== undefined || b.gitCommit === true) &&
+    ((b.writableRoots === undefined && b.sandboxPolicy === undefined) ||
+      (b.sandbox === "workspace-write" && Array.isArray(b.writableRoots) && b.writableRoots.length > 0 &&
+        b.writableRoots.every((p) => typeof p === "string" && isAbsolute(p)) &&
         typeof b.sandboxPolicy === "object" && b.sandboxPolicy !== null &&
         (b.sandboxPolicy as WorkspaceWritePolicy).type === "workspaceWrite" &&
         typeof (b.sandboxPolicy as WorkspaceWritePolicy).networkAccess === "boolean" &&
         Array.isArray((b.sandboxPolicy as WorkspaceWritePolicy).writableRoots) &&
         (b.sandboxPolicy as WorkspaceWritePolicy).writableRoots.every((p) => typeof p === "string" && isAbsolute(p)) &&
-        [...(b.writableRoots as string[] | undefined ?? []), ...(b.gitRoots as string[] | undefined ?? [])].every((p) => (b.sandboxPolicy as WorkspaceWritePolicy).writableRoots.includes(p)) &&
+        b.writableRoots.every((p) => (b.sandboxPolicy as WorkspaceWritePolicy).writableRoots.includes(p)) &&
         [undefined, true, false].includes((b.sandboxPolicy as WorkspaceWritePolicy).excludeSlashTmp) &&
         [undefined, true, false].includes((b.sandboxPolicy as WorkspaceWritePolicy).excludeTmpdirEnvVar))) &&
     (b.model === undefined || typeof b.model === "string") &&
@@ -86,7 +80,7 @@ function validate(threadId: string, value: unknown): ThreadBinding {
 }
 
 export class BindingStore {
-  constructor(private readonly dir: string) {}
+  constructor(readonly dir: string) {}
 
   private fileFor(threadId: string): string {
     return join(this.dir, `${createHash("sha256").update(threadId).digest("hex")}.json`);

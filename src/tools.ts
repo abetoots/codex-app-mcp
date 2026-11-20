@@ -1,20 +1,20 @@
 // zod schemas + handlers for the `codex` / `codex-reply` tools, re-exposing the removed `codex
 // mcp-server`'s 0.151.0 field set over a TurnRunner so the multi-model/gauntlet skills need zero
 // changes. knows nothing about stdio/child-process wiring -- src/index.ts owns that.
-import { lstatSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
+import { delimiter, dirname, isAbsolute, join, parse, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import type { CallToolResult, ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { ToolCallback } from "@modelcontextprotocol/sdk/server/mcp.js";
 
-import type { GrantClient, GrantDecision, GrantRequest } from "./grant-client.js";
+import { defaultCheckerPath, type GrantClient, type GrantDecision, type GrantRequest } from "./grant-client.js";
 import type { BindingStore, ThreadBinding } from "./thread-binding.js";
 import type { RunTurnOptions, StartThreadOptions, SupportedEfforts, ThreadSettings, TurnResult, WorkspaceWritePolicy } from "./turn-runner.js";
-import { delegateConfig, issueTicket } from "./ticket-client.js";
+import { delegateConfig, issueTicket, ticketHelperPath } from "./ticket-client.js";
 
 // the subset of TurnRunner's public surface these tools call -- a structural interface (rather
 // than importing the TurnRunner class type itself) so src/index.ts's lazy-spawn/respawn wrapper
@@ -47,7 +47,7 @@ async function effortError(
 // grant checker (only `check` is used, so a test can hand in a stub).
 export interface BindingDeps {
   bindings: BindingStore;
-  grants: Pick<GrantClient, "check">;
+  grants: Pick<GrantClient, "check"> & Partial<Pick<GrantClient, "checkerPath">>;
 }
 
 const CONFIG_UNSUPPORTED_TEXT =
@@ -72,29 +72,124 @@ function realPath(path: string): string {
 }
 
 const same = (a: unknown, b: unknown): boolean => JSON.stringify(a) === JSON.stringify(b);
-const inside = (child: string, parent: string): boolean => child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep);
 const sorted = (paths: string[]): string[] => [...new Set(paths)].sort();
 
-function writableRoots(paths: string[], cwd: string): string[] {
+function canonicalPath(path: string): string {
+  const absolute = resolve(path);
+  try { return realpathSync(absolute); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT" && (err as NodeJS.ErrnoException).code !== "ENOTDIR") throw err;
+    const parent = dirname(absolute);
+    if (parent === absolute) throw err;
+    return join(canonicalPath(parent), absolute.slice(parent.length + (parent.endsWith(sep) ? 0 : 1)));
+  }
+}
+
+function contains(ancestor: string, path: string): boolean {
+  let target: ReturnType<typeof statSync>;
+  try { target = statSync(ancestor); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT" || (err as NodeJS.ErrnoException).code === "ENOTDIR") return false;
+    throw err;
+  }
+  for (let current = canonicalPath(path); ; current = dirname(current)) {
+    try {
+      const entry = statSync(current);
+      if (entry.dev === target.dev && entry.ino === target.ino) return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT" && (err as NodeJS.ErrnoException).code !== "ENOTDIR") throw err;
+    }
+    if (dirname(current) === current) return false;
+  }
+}
+
+function executablePath(command: string): string {
+  if (command.includes(sep)) return resolve(command);
+  for (const dir of (process.env.PATH ?? "/usr/bin:/bin").split(delimiter)) {
+    const candidate = resolve(dir || ".", command);
+    try { accessSync(candidate, constants.X_OK); if (statSync(candidate).isFile()) return candidate; } catch { /* try next */ }
+  }
+  return resolve(command);
+}
+
+function checkedCwd(cwd: string): string {
+  try {
+    const current = realpathSync(cwd);
+    if (current === cwd && statSync(current).isDirectory()) return current;
+  } catch { /* reported below */ }
+  throw new Error("bound cwd changed since thread start");
+}
+
+function repoMetadata(cwd: string): string[] {
+  for (let dir = cwd; ; dir = dirname(dir)) {
+    const marker = join(dir, ".git");
+    let stat: ReturnType<typeof statSync> | undefined;
+    try { stat = statSync(marker); }
+    catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+    if (stat) {
+      let gitDir: string;
+      if (stat.isDirectory()) gitDir = realpathSync(marker);
+      else if (stat.isFile()) {
+        const match = /^gitdir: (.+)\s*$/i.exec(readFileSync(marker, "utf8").trim());
+        if (!match) throw new Error("cannot inspect cwd git metadata");
+        gitDir = realpathSync(resolve(dir, match[1]));
+      } else throw new Error("cannot inspect cwd git metadata");
+      let commonFile: string | undefined;
+      try { commonFile = readFileSync(join(gitDir, "commondir"), "utf8").trim(); }
+      catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+      if (commonFile === "") throw new Error("cannot inspect cwd git metadata");
+      return [gitDir, commonFile === undefined ? gitDir : canonicalPath(resolve(gitDir, commonFile))];
+    }
+    if (dirname(dir) === dir) return [];
+  }
+}
+
+function writableRoots(paths: string[], cwd: string, deps: BindingDeps): string[] {
   if (!paths.length) throw new Error("writable-roots must contain at least one directory");
+  const checker = executablePath(deps.grants.checkerPath ?? defaultCheckerPath());
+  const helper = executablePath(ticketHelperPath());
+  const anchors: Array<[string, string]> = [
+    [deps.bindings.dir, "bindings"],
+    [dirname(checker), "grant-check"],
+    [dirname(canonicalPath(checker)), "grant-check"],
+    [dirname(helper), "ticket-helper"],
+    [dirname(canonicalPath(helper)), "ticket-helper"],
+    [fileURLToPath(new URL("..", import.meta.url)), "bridge install"],
+  ];
+  const metadata = repoMetadata(cwd);
   const roots = paths.map((path) => {
     if (!isAbsolute(path)) throw new Error("writable-roots must be absolute paths");
     if (path.split(sep).includes("..")) throw new Error("writable-roots cannot contain '..'");
     const hasCodex = (p: string): boolean => p.split(sep).some((part) => part.toLowerCase() === ".codex");
     if (hasCodex(path)) throw new Error("writable-roots cannot contain a .codex segment");
     let real: string;
-    try {
-      real = realpathSync(path);
-      if (!statSync(real).isDirectory()) throw new Error();
-    } catch { throw new Error("writable-roots must be an existing directory"); }
-    if (hasCodex(real)) throw new Error("writable-roots cannot contain a .codex segment");
+    try { real = realpathSync(path); }
+    catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") throw new Error("writable-roots path does not exist");
+      if ((err as NodeJS.ErrnoException).code === "ENOTDIR") throw new Error("writable-roots path is not a directory");
+      throw new Error("writable-roots path cannot be inspected");
+    }
+    if (!statSync(real).isDirectory()) throw new Error("writable-roots path is not a directory");
+    if (hasCodex(real)) throw new Error("writable-roots cannot resolve to a .codex segment");
     if (real === parse(real).root) throw new Error("writable-roots cannot be the filesystem root");
-    if (inside(realPath(homedir()), real)) throw new Error("writable-roots cannot be home or its ancestor");
-    if (inside(cwd, real)) throw new Error("writable-roots cannot be cwd or its ancestor");
-    if (inside(real, cwd)) throw new Error("writable-roots cannot be inside cwd");
+    if (contains(real, realPath(homedir()))) throw new Error("writable-roots cannot be home or its ancestor");
+    if (contains(real, cwd) && contains(cwd, real)) throw new Error("writable-roots cannot be cwd");
+    if (contains(real, cwd)) throw new Error("writable-roots cannot be an ancestor of cwd");
+    if (contains(cwd, real)) throw new Error("writable-roots cannot be inside cwd");
+    for (const [anchor, label] of anchors) {
+      if (contains(real, anchor) || contains(anchor, real)) throw new Error(`writable-roots overlap the ${label} directory`);
+    }
+    if (metadata.some((dir) => contains(real, dir) || contains(dir, real))) throw new Error("writable-roots overlap cwd git metadata");
     for (let dir = real; ; dir = dirname(dir)) {
-      const isFile = (name: string): boolean => { try { return statSync(join(dir, name)).isFile(); } catch { return false; } };
-      const isDir = (name: string): boolean => { try { return statSync(join(dir, name)).isDirectory(); } catch { return false; } };
+      const entry = (name: string): ReturnType<typeof statSync> | undefined => {
+        try { return statSync(join(dir, name)); }
+        catch (err) {
+          if ((err as NodeJS.ErrnoException).code === "ENOENT" || (err as NodeJS.ErrnoException).code === "ENOTDIR") return undefined;
+          throw err;
+        }
+      };
+      const isFile = (name: string): boolean => entry(name)?.isFile() ?? false;
+      const isDir = (name: string): boolean => entry(name)?.isDirectory() ?? false;
       if (isFile("commondir") || (isFile("HEAD") && isDir("objects") && isDir("refs"))) {
         throw new Error("writable-roots cannot be inside a git directory");
       }
@@ -102,77 +197,21 @@ function writableRoots(paths: string[], cwd: string): string[] {
     }
     return real;
   });
-  const result = sorted(roots);
-  if (result.some((root, i) => result.some((other, j) => i !== j && inside(root, other)))) {
+  const result = sorted(roots).filter((root, index, all) => !all.slice(0, index).some((other) => {
+    const a = statSync(root), b = statSync(other);
+    return a.dev === b.dev && a.ino === b.ino;
+  }));
+  if (result.some((root, i) => result.some((other, j) => i !== j && contains(other, root)))) {
     throw new Error("writable-roots cannot be inside another requested root");
   }
   return result;
 }
 
-function gitCommitRoots(cwd: string): { roots: string[]; head: string; gitDir: string } {
-  let lines: string[];
-  try {
-    const args = ["-C", cwd, "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir", "--abbrev-ref", "HEAD"];
-    try { lines = execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim().split("\n"); }
-    catch { lines = execFileSync("git", args.filter((arg) => arg !== "--path-format=absolute"), { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim().split("\n"); }
-    if (lines.length !== 3) throw new Error();
-    lines[0] = realpathSync(resolve(cwd, lines[0]));
-    lines[1] = realpathSync(resolve(cwd, lines[1]));
-  } catch { throw new Error("git-commit requires a linked worktree on a codex/* branch"); }
-  const [gitDir, common, branch] = lines;
-  if (gitDir === common || dirname(gitDir) !== join(common, "worktrees")) throw new Error("git-commit requires a linked worktree");
-  if (!branch.startsWith("codex/") || branch.length <= "codex/".length) throw new Error("git-commit requires a codex/* branch");
-  const heads = join(common, "refs", "heads", "codex"), logs = join(common, "logs", "refs", "heads", "codex");
-  mkdirSync(heads, { recursive: true });
-  mkdirSync(logs, { recursive: true });
-  const roots = [join(common, "objects"), heads, logs, gitDir].map((p) => realpathSync(p));
-  if (roots[0] !== join(common, "objects") || roots[1] !== heads || roots[2] !== logs) throw new Error("git-commit metadata paths have changed");
-  return { roots, head: `refs/heads/${branch}`, gitDir };
-}
-
-function snapshotGit(gitDir: string): () => void {
-  const names = ["commondir", "gitdir", "config.worktree"];
-  const snapshot = (name: string): { data: Buffer; mode: number } | undefined => {
-    const path = join(gitDir, name);
-    try {
-      const stat = lstatSync(path);
-      if (!stat.isFile()) throw new Error(`${name} is not a regular file`);
-      return { data: readFileSync(path), mode: stat.mode & 0o777 };
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-      throw err;
-    }
-  };
-  const original = names.map(snapshot);
-  return () => {
-    const changed: string[] = [];
-    for (let i = 0; i < names.length; i++) {
-      const name = names[i], path = join(gitDir, name), before = original[i];
-      let after: ReturnType<typeof snapshot>;
-      try { after = snapshot(name); } catch { after = undefined; }
-      if (before && after && before.data.equals(after.data) && before.mode === after.mode) continue;
-      if (!before && !after) {
-        try { lstatSync(path); } catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue; throw err; }
-      }
-      changed.push(name);
-      try {
-        try { unlinkSync(path); } catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
-        if (before) writeFileSync(path, before.data, { mode: before.mode, flag: "wx" });
-      } catch (err) { throw new Error(`git-commit could not restore ${name}: ${errorMessage(err)}`); }
-    }
-    let head = "";
-    try { if (lstatSync(join(gitDir, "HEAD")).isFile()) head = readFileSync(join(gitDir, "HEAD"), "utf8").trim(); } catch { /* reported below */ }
-    if (!/^ref: refs\/heads\/codex\/[^\r\n]+$/.test(head)) changed.push("HEAD (not on a codex/* branch)");
-    if (changed.length) throw new Error(`git-commit integrity check failed: ${changed.join(", ")}`);
-  };
-}
-
-function boundExtraRoots(binding: ThreadBinding): string[] {
-  const roots = binding.writableRoots === undefined ? [] : writableRoots(binding.writableRoots, binding.cwd);
+function boundExtraRoots(binding: ThreadBinding, deps: BindingDeps): string[] {
+  const cwd = checkedCwd(binding.cwd);
+  const roots = binding.writableRoots === undefined ? [] : writableRoots(binding.writableRoots, cwd, deps);
   if (!same(roots, binding.writableRoots ?? [])) throw new Error("writable-roots changed since thread start");
-  const git = binding.gitCommit ? gitCommitRoots(binding.cwd) : undefined;
-  if (git && (!same(git.roots, binding.gitRoots) || git.head !== binding.gitHead)) throw new Error("git-commit roots or branch changed since thread start");
-  return sorted([...roots, ...(git?.roots ?? [])]);
+  return roots;
 }
 
 // the checker's decision, or an error: a denied decision, an unreachable checker, and (when the
@@ -373,7 +412,6 @@ const codexInputShape = {
   "approval-policy": z.enum(["untrusted", "on-failure", "on-request", "never"]).default("never"),
   sandbox: z.enum(["read-only", "workspace-write", "danger-full-access"]).default("read-only"),
   "writable-roots": z.array(z.string()).optional().describe("Additional absolute directories writable under workspace-write."),
-  "git-commit": z.boolean().optional().describe("Allow commits in a linked codex/* worktree."),
   config: z.record(z.string(), z.unknown()).optional(),
   "base-instructions": z.string().optional(),
   "developer-instructions": z.string().optional(),
@@ -398,17 +436,16 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
 
     const cwd = realPath(input.cwd ?? process.cwd());
     let roots: string[] | undefined;
-    let git: ReturnType<typeof gitCommitRoots> | undefined;
     try {
-      if ((input["writable-roots"] !== undefined || input["git-commit"] === true) && input.sandbox !== "workspace-write") {
-        throw new Error("writable-roots and git-commit require sandbox workspace-write. Nothing was sent to Codex.");
+      checkedCwd(cwd);
+      if (input["writable-roots"] !== undefined && input.sandbox !== "workspace-write") {
+        throw new Error("writable-roots require sandbox workspace-write. Nothing was sent to Codex.");
       }
-      if (input["writable-roots"] !== undefined) roots = writableRoots(input["writable-roots"], cwd);
-      if (input["git-commit"] === true) git = gitCommitRoots(cwd);
+      if (input["writable-roots"] !== undefined) roots = writableRoots(input["writable-roots"], cwd, deps);
     } catch (err) {
       return buildRejectedResult(err, undefined, []);
     }
-    const addDirs = sorted([...(roots ?? []), ...(git?.roots ?? [])]);
+    const addDirs = roots ?? [];
     const dispatchId = randomUUID();
     const startRequest: GrantRequest = {
       phase: "start",
@@ -422,6 +459,7 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
     let decision: GrantDecision;
     try {
       decision = await allowedDecision(deps, startRequest);
+      checkedCwd(cwd);
     } catch (err) {
       return buildRejectedResult(err, undefined, []);
     }
@@ -452,6 +490,7 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
 
     let threadId: string | undefined;
     try {
+      checkedCwd(cwd);
       const started = await turnRunner.startThread({
         cwd,
         model: input.model,
@@ -464,7 +503,7 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
       const startedId = started.threadId;
 
       let sandboxPolicy: WorkspaceWritePolicy | undefined;
-      if (roots !== undefined || git !== undefined) {
+      if (roots !== undefined) {
         const policy = started.sandbox;
         if (policy?.type !== "workspaceWrite" || (policy.networkAccess !== undefined && typeof policy.networkAccess !== "boolean")) {
           throw new Error("cannot determine the effective workspace-write sandbox policy; no turn was sent to Codex.");
@@ -487,8 +526,6 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
         approvalPolicy,
         sandbox: input.sandbox,
         ...(roots !== undefined ? { writableRoots: roots } : {}),
-        ...(input["git-commit"] !== undefined ? { gitCommit: input["git-commit"] } : {}),
-        ...(git !== undefined ? { gitRoots: git.roots, gitHead: git.head } : {}),
         ...(sandboxPolicy !== undefined ? { sandboxPolicy } : {}),
         ...(ticketId !== undefined ? { ticketId } : {}),
         ...(input.model !== undefined ? { model: input.model } : {}),
@@ -509,7 +546,6 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
 
       // model went on thread/start above; effort has no thread/start field, so it rides on the
       // first turn/start, where app-server makes it sticky for the rest of the thread.
-      let checkIntegrity: (() => void) | undefined;
       const turnResult = await runTurnWithProgress(
         turnRunner,
         threadId,
@@ -521,7 +557,7 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
           // once the turn has its place in the queue, a resume check on the binding just saved:
           // its project, grant and revision, and the same fingerprint
           beforeStart: async () => {
-            const checkedRoots = boundExtraRoots(binding);
+            const checkedRoots = boundExtraRoots(binding, deps);
             await allowedDecision(
               deps,
               {
@@ -535,10 +571,8 @@ export function createCodexTool(turnRunner: TurnRunnerLike, deps: BindingDeps): 
               },
               binding.effectiveHash,
             );
-            boundExtraRoots(binding);
-            if (binding.gitCommit) checkIntegrity = snapshotGit(binding.gitRoots![3]);
+            boundExtraRoots(binding, deps);
           },
-          afterFinish: async () => { checkIntegrity?.(); },
         },
         extra,
       );
@@ -572,7 +606,6 @@ const codexReplyInputSchema = z
       .optional()
       .describe("Optional. Must be the directory the thread was started in; a different one is refused."),
     "writable-roots": z.array(z.string()).optional().describe("Optional. Must match the roots bound to the thread."),
-    "git-commit": z.boolean().optional().describe("Optional. Must match the thread binding."),
     model: z
       .string()
       .optional()
@@ -617,14 +650,12 @@ export function createCodexReplyTool(turnRunner: TurnRunnerLike, deps: BindingDe
       if (input.cwd !== undefined && realPath(input.cwd) !== bound.cwd) {
         throw new Error("cwd differs from the directory this thread was started in. Nothing was sent to Codex.");
       }
+      const cwd = checkedCwd(bound.cwd);
       if (input["writable-roots"] !== undefined &&
-          !same(writableRoots(input["writable-roots"], bound.cwd), bound.writableRoots)) {
+          (bound.writableRoots === undefined || !same(writableRoots(input["writable-roots"], cwd, deps), bound.writableRoots))) {
         throw new Error("writable-roots differ from the roots this thread was started with. Nothing was sent to Codex.");
       }
-      if (input["git-commit"] !== undefined && input["git-commit"] !== bound.gitCommit) {
-        throw new Error("git-commit differs from the setting this thread was started with. Nothing was sent to Codex.");
-      }
-      const addDirs = boundExtraRoots(bound);
+      const addDirs = boundExtraRoots(bound, deps);
       const resumeRequest: GrantRequest = {
         phase: "resume",
         harness: "codex",
@@ -645,7 +676,6 @@ export function createCodexReplyTool(turnRunner: TurnRunnerLike, deps: BindingDe
       });
       const invalidEffort = await effortError(turnRunner, input.effort, { model: input.model, threadId });
       if (invalidEffort !== undefined) return buildRejectedResult(new Error(invalidEffort), threadId, []);
-      let checkIntegrity: (() => void) | undefined;
       const turnResult = await runTurnWithProgress(
         turnRunner,
         threadId,
@@ -658,16 +688,14 @@ export function createCodexReplyTool(turnRunner: TurnRunnerLike, deps: BindingDe
           // under the thread's lock: the check again after any queue wait, then the model switch
           // is recorded, so a restart resumes on the model the thread last used
           beforeStart: async () => {
-            const checkedRoots = boundExtraRoots(bound);
+            const checkedRoots = boundExtraRoots(bound, deps);
             await allowedDecision(deps, { ...resumeRequest, addDirs: checkedRoots }, bound.effectiveHash);
-            boundExtraRoots(bound);
-            if (bound.gitCommit) checkIntegrity = snapshotGit(bound.gitRoots![3]);
+            boundExtraRoots(bound, deps);
             if (input.model === undefined) return;
             const fresh = await deps.bindings.load(threadId);
             if (!fresh) throw new Error(NO_BINDING_TEXT);
             if (fresh.model !== input.model) await deps.bindings.save({ ...fresh, model: input.model });
           },
-          afterFinish: async () => { checkIntegrity?.(); },
         },
         extra,
       );

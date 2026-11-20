@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,7 +22,7 @@ async function deps(...seededThreads: string[]): Promise<BindingDeps> {
     await bindings.save({
       schema: 1,
       threadId,
-      cwd: "/tmp/x",
+      cwd: realpathSync(process.cwd()),
       project: null,
       grantId: null,
       grantRevision: null,

@@ -137,7 +137,7 @@ describe("real MCP stdio surface (node dist/index.js over stdio)", () => {
     expect(codexSchema.properties.sandbox.default).toBe("read-only");
     expect(codexSchema.properties.sandbox.enum).toEqual(["read-only", "workspace-write", "danger-full-access"]);
     expect(codexSchema.properties["writable-roots"]).toMatchObject({ type: "array", items: { type: "string" } });
-    expect(codexSchema.properties["git-commit"]).toMatchObject({ type: "boolean" });
+    expect(codexSchema.properties["git-commit"]).toBeUndefined();
     expect(codexSchema.properties["timeout-seconds"].default).toBe(900);
     expect(codexSchema.properties.profile).toBeDefined();
     expect(codexSchema.properties.effort).toBeDefined();
@@ -150,7 +150,7 @@ describe("real MCP stdio surface (node dist/index.js over stdio)", () => {
     expect(replySchema.required).toEqual(["prompt"]);
     expect(replySchema.properties.threadId).toBeDefined();
     expect(replySchema.properties["writable-roots"]).toMatchObject({ type: "array", items: { type: "string" } });
-    expect(replySchema.properties["git-commit"]).toMatchObject({ type: "boolean" });
+    expect(replySchema.properties["git-commit"]).toBeUndefined();
     expect(replySchema.properties.conversationId).toBeDefined();
     expect(replySchema.properties["timeout-seconds"].default).toBe(900);
     expect(replySchema.properties.model).toBeDefined();
